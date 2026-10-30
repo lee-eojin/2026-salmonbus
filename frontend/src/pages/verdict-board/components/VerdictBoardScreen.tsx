@@ -1,7 +1,8 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import type { EventMap } from "@/shared/analytics/events";
 import { track } from "@/shared/analytics/track";
+import { visuallyHidden } from "@/shared/styles/accessibility.css";
 import type { ApiFailure, ApiResult } from "@/shared/api/client";
 import { latestSuccessOf, type PolledResource } from "@/shared/api/polledResource";
 import { fetchRouteWatch } from "@/shared/api/routeForecast.api";
@@ -113,6 +114,7 @@ function RouteBoard({ routeId }: { routeId: Board["route"]["id"] }) {
       : null;
   return (
     <main className={styles.noticePage}>
+      <h1 className={visuallyHidden}>노선 판정보드</h1>
       <BoardBackLink />
       {status === "outOfService" ? (
         <div className={styles.outOfService}>
@@ -143,6 +145,7 @@ function OperatingBoard({
   onDirectionChange,
   onStopExpand,
 }: OperatingBoardProps) {
+  const sheetId = useId();
   const viewport = useBoardViewport();
   const [search, setSearch] = useSearchParams();
   const [snap, setSnap] = useState<BoardSheetSnap>("expanded");
@@ -256,6 +259,16 @@ function OperatingBoard({
   return (
     <div className={styles.page} style={{ height: viewport.height, top: viewport.top }}>
       <main className={styles.content}>
+        <a
+          href={`#${sheetId}`}
+          className={styles.skipLink}
+          onClick={(event) => {
+            event.preventDefault();
+            document.getElementById(sheetId)?.focus({ preventScroll: true });
+          }}
+        >
+          판정보드로 바로가기
+        </a>
         <div className={styles.mapSlot} inert={!mapVisible} aria-hidden={!mapVisible}>
           <RouteMap
             board={board}
@@ -275,6 +288,7 @@ function OperatingBoard({
           <BoardBackLink />
         </div>
         <BoardBottomSheet
+          id={sheetId}
           snap={snap}
           onSnapChange={setSnap}
           viewportHeight={viewport.height}
