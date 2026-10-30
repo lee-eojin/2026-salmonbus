@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { matchPath, Outlet, Route, Routes } from "react-router";
 import { RouteSearchPage } from "@/pages/route-search";
 import { RouteSelectPage } from "@/pages/route-select";
@@ -9,9 +9,26 @@ import { LoginPage } from "@/pages/login";
 import { MyPage } from "@/pages/my-page";
 import { FavoriteGroupPage } from "@/pages/favorite-group";
 import { NicknamePage } from "@/pages/nickname";
+import { AccountLayout } from "@/shared/components/AccountLayout";
 import { WhatsNewPage } from "@/pages/whats-new";
 import { useFocusKeepingNavigation } from "./useFocusKeepingNavigation";
 import { BottomNavigation } from "@/shared/components/BottomNavigation";
+
+const PrivacyPage = lazy(async () => ({
+  default: (await import(/* webpackChunkName: "privacy" */ "@/pages/privacy")).PrivacyPage,
+}));
+
+const privacyPage = (
+  <Suspense
+    fallback={
+      <AccountLayout>
+        <p role="status">처리방침을 불러오고 있어요…</p>
+      </AccountLayout>
+    }
+  >
+    <PrivacyPage />
+  </Suspense>
+);
 
 function NavigationLayout() {
   return (
@@ -27,6 +44,8 @@ const pagesWithNavigation = [
   { path: paths.mypage, title: "마이페이지", element: <MyPage /> },
   { path: paths.nickname, title: "닉네임 수정", element: <NicknamePage /> },
   { path: paths.favoriteGroup, title: "즐겨찾기 그룹 관리", element: <FavoriteGroupPage /> },
+  { path: paths.privacy, title: "개인정보 처리방침", element: privacyPage },
+  { path: paths.privacyEdition, title: "개인정보 처리방침", element: privacyPage },
   { path: paths.whatsNew, title: "새 소식", element: <WhatsNewPage /> },
 ];
 

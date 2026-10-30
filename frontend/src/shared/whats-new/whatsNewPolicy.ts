@@ -1,3 +1,4 @@
+import { kstDayOf } from "@/shared/utils/kstDayOf";
 import type { RouteSummary } from "@/shared/api/routeForecast.types";
 import { listedRoutesFor, type FirstSeenTimes, type ListedRoute } from "@/shared/route-list/newRoutePolicy";
 import type { WhatsNewNote } from "./whatsNewNotes";
@@ -11,7 +12,6 @@ export interface WhatsNewRecord {
 export type WhatsNewCloseMethod = "closeButton" | "backdrop" | "escape" | "routeRow";
 
 const AUTO_SHOW_PERIOD_MS = 7 * 24 * 60 * 60_000;
-const KST_OFFSET_MS = 9 * 60 * 60_000;
 
 export function firstRecordFor(notes: readonly WhatsNewNote[], hasVisitedBefore: boolean, now: number): WhatsNewRecord {
   return {
@@ -72,8 +72,4 @@ export function latestIdOf(notes: readonly WhatsNewNote[]): number {
 
 function autoShowEndOf(note: WhatsNewNote): number {
   return Date.parse(`${note.publishedAt}T00:00:00+09:00`) + AUTO_SHOW_PERIOD_MS;
-}
-
-function kstDayOf(now: number): string {
-  return new Date(now + KST_OFFSET_MS).toISOString().slice(0, 10);
 }
