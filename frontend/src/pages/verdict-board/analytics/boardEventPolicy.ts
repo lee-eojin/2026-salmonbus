@@ -3,6 +3,7 @@ import type { Board, Direction } from "@/shared/api/routeForecast.types";
 import type { BoardEntry } from "@/shared/routing/boardEntry";
 import { representativeArrival, type ArrivalTone } from "../components/arrivalPolicy";
 import { stopViewsFor, type ExpandableStopView } from "../components/displayPolicy";
+import type { ArrivalHide } from "../components/stationArrivalPolicy";
 
 interface BoardViewContext {
   routeId: string;
@@ -83,5 +84,20 @@ export function stopExpandedPropertiesOf(
     level: representative.level,
     stops_away: representative.stopsAway,
     arrival_count: stop.arrivals.length,
+  };
+}
+
+export function arrivalCardHiddenPropertiesOf(hide: ArrivalHide): EventMap["arrival_card_hidden"] {
+  const { selection, vehicleId, reason, hiddenAt, expectedArrivalAt, lastPolledAt } = hide;
+  return {
+    route_id: selection.routeId,
+    direction: selection.direction,
+    stop_id: selection.stationId,
+    stop_sequence: selection.stopSequence,
+    vehicle_id: vehicleId,
+    hidden_at: new Date(hiddenAt).toISOString(),
+    expected_arrival_at: new Date(expectedArrivalAt).toISOString(),
+    last_polled_at: new Date(lastPolledAt).toISOString(),
+    reason,
   };
 }

@@ -3,7 +3,7 @@ import type { ApproachingVehicle, Direction } from "@/shared/api/routeForecast.t
 import { boardWith, stopAt } from "@/testing/fixtures";
 import { forecastFixtures } from "@/testing/forecastFixtures";
 import { stopViewsFor, type ExpandableStopView } from "../components/displayPolicy";
-import { boardViewedPropertiesOf, stopExpandedPropertiesOf } from "./boardEventPolicy";
+import { arrivalCardHiddenPropertiesOf, boardViewedPropertiesOf, stopExpandedPropertiesOf } from "./boardEventPolicy";
 
 function approaching(seatAvailableProbability: number): ApproachingVehicle[] {
   return [{ vehicleId: null, remainingStops: 2, forecast: { status: "AVAILABLE", seatAvailableProbability } }];
@@ -138,6 +138,37 @@ describe("stopExpandedPropertiesOf", () => {
       row_position: 3,
       expand_index: 2,
       source: "map",
+    });
+  });
+});
+
+describe("arrivalCardHiddenPropertiesOf", () => {
+  it("선택한 방문과 차량, 숨긴 이유를 옮기고 세 시각을 ISO 문자열로 보낸다", () => {
+    expect(
+      arrivalCardHiddenPropertiesOf({
+        selection: {
+          stationId: "206000637",
+          routeId: "204000057",
+          referenceVersionId: "7",
+          stopSequence: 22,
+          direction: "UP",
+        },
+        vehicleId: "bus-1",
+        reason: "walk_time",
+        hiddenAt: Date.parse("2026-10-16T03:00:30.001Z"),
+        expectedArrivalAt: Date.parse("2026-10-16T03:01:30Z"),
+        lastPolledAt: Date.parse("2026-10-16T03:00:00Z"),
+      }),
+    ).toEqual({
+      route_id: "204000057",
+      direction: "UP",
+      stop_id: "206000637",
+      stop_sequence: 22,
+      vehicle_id: "bus-1",
+      hidden_at: "2026-10-16T03:00:30.001Z",
+      expected_arrival_at: "2026-10-16T03:01:30.000Z",
+      last_polled_at: "2026-10-16T03:00:00.000Z",
+      reason: "walk_time",
     });
   });
 });

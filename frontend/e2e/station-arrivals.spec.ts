@@ -179,6 +179,30 @@ test("ETA 시간이 지나도 도착으로 추정하지 않고 snapshot 만료 �
   ]);
 });
 
+test("폴링 사이에 걸어갈 시간이 사라진 버스는 숨기고 더 늦은 ETA가 오면 다시 보여 준다", async ({ page, api }) => {
+  const passing = readyArrivals();
+  passing.routes[0]!.arrivals[1]!.eta.expectedArrivalAt = new Date(now + 90_000).toISOString();
+  api.data.arrivals = passing;
+  await openBoard(page);
+  await targetStop(page, "UP").click();
+  const row = targetRow(page, "UP");
+  await expect(row.getByText("2분 남음", { exact: true })).toBeVisible();
+  await page.clock.fastForward(31_000);
+  await expect(row.getByRole("listitem")).toHaveCount(0);
+  await expect(row.getByText("현재 예측할 수 있는 차량이 없습니다", { exact: true })).toBeVisible();
+  expect(api.requests.arrivals).toBe(1);
+
+  const delayed = readyArrivals();
+  delayed.routes[0]!.arrivals[1]!.eta.expectedArrivalAt = new Date(now + 300_000).toISOString();
+  api.data.arrivals = delayed;
+  await page.clock.fastForward(9_100);
+  await expect(row.getByRole("listitem")).toHaveText([
+    /5분 남음\s*3정류장 전\s*도착 시 5석 예상해요/,
+    /4분 남음\s*7정류장 전\s*도착 시 2석 예상해요/,
+  ]);
+  expect(api.requests.arrivals).toBe(2);
+});
+
 // 빈 결과도 시간만 숨기고 watch 거리와 좌석을 바꾸지 않는 규칙은 stationArrivalPolicy 단위 테스트가 본다.
 test("도착정보 조회 실패에도 watch 거리와 좌석 예보를 유지한다", async ({ page, api }) => {
   api.mode.arrivals = "network-error";

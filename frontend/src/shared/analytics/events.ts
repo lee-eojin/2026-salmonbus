@@ -102,6 +102,18 @@ export interface EventMap {
       })
     | (StopExpandedBase & { stop_kind: "noVehicle"; arrival_count: 0 });
 
+  arrival_card_hidden: {
+    route_id: string;
+    direction: Direction;
+    stop_id: string;
+    stop_sequence: number;
+    vehicle_id: string;
+    hidden_at: string;
+    expected_arrival_at: string;
+    last_polled_at: string;
+    reason: "walk_time" | "stale";
+  };
+
   login_started: {
     provider: LoginProvider;
     entry: "favorite" | "home" | "mypage";

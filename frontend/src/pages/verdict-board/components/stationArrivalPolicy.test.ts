@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@jest/globals";
 import type { ArrivalVehicle, StationArrivalsResponse } from "@/shared/api/stationArrivals.types";
-import { arrivalTimingFor, type StationArrivalDetails } from "./stationArrivalPolicy";
+import { arrivalTimingFor, nextArrivalHideStep, type StationArrivalDetails } from "./stationArrivalPolicy";
 import type { ArrivalView } from "./arrivalPolicy";
 
 const now = Date.parse("2026-10-16T03:00:00Z");
@@ -227,5 +227,168 @@ describe("arrivalTimingFor", () => {
     expect(
       arrivalTimingFor(arrival, { ...details, resource: { status: "loadingError", failure: { kind: "timeout" } } }),
     ).toBeNull();
+  });
+});
+
+describe("nextArrivalHideStep", () => {
+  const seconds = (value: number) => now + value * 1000;
+
+  function polledAt(servedAt: number, etaSeconds: number) {
+    const details = detailsWith(etaSeconds);
+    details.resource.latestSuccess.clock.servedAt = servedAt;
+    return details;
+  }
+
+  function hiddenFor(etaSeconds = 90) {
+    const details = detailsWith(etaSeconds);
+    const { known } = nextArrivalHideStep(null, arrival, details, seconds(etaSeconds - 60) + 1);
+    expect(known?.hidden).toBe(true);
+    return known;
+  }
+
+  it("도착까지 정확히 60초 남으면 유지하고 1ms 더 지나면 walk_time으로 숨긴다", () => {
+    const details = detailsWith(90);
+    expect(nextArrivalHideStep(null, arrival, details, seconds(30))).toMatchObject({ hidden: false, hide: null });
+    expect(nextArrivalHideStep(null, arrival, details, seconds(30) + 1)).toMatchObject({
+      hidden: true,
+      hide: { reason: "walk_time" },
+    });
+  });
+
+  it("새 폴링이 없어도 같은 응답에서 시간이 지나면 숨긴다", () => {
+    const details = detailsWith(90);
+    const first = nextArrivalHideStep(null, arrival, details, now);
+    expect(first.hidden).toBe(false);
+    const second = nextArrivalHideStep(first.known, arrival, details, seconds(31));
+    expect(second.hidden).toBe(true);
+    expect(second.hide?.reason).toBe("walk_time");
+  });
+
+  it("마지막 폴링 뒤 정확히 60초면 유지하고 1ms 더 지나면 stale로 숨긴다", () => {
+    const details = detailsWith(600);
+    expect(nextArrivalHideStep(null, arrival, details, seconds(60))).toMatchObject({ hidden: false, hide: null });
+    expect(nextArrivalHideStep(null, arrival, details, seconds(60) + 1)).toMatchObject({
+      hidden: true,
+      hide: { reason: "stale" },
+    });
+  });
+
+  it("두 조건이 모두 맞으면 stale로 남긴다", () => {
+    expect(nextArrivalHideStep(null, arrival, detailsWith(90), seconds(61)).hide?.reason).toBe("stale");
+  });
+
+  it("숨겨진 동안 이어지는 틱과 여전히 숨길 폴링에서는 이벤트를 다시 보내지 않는다", () => {
+    const details = detailsWith(90);
+    const first = nextArrivalHideStep(null, arrival, details, seconds(31));
+    expect(first.hide).not.toBeNull();
+    const nextTick = nextArrivalHideStep(first.known, arrival, details, seconds(32));
+    expect(nextTick).toMatchObject({ hidden: true, hide: null });
+    const nextPoll = nextArrivalHideStep(nextTick.known, arrival, polledAt(seconds(40), 90), seconds(41));
+    expect(nextPoll).toMatchObject({ hidden: true, hide: null });
+  });
+
+  it("더 늦은 ETA가 오면 다시 보여 주고 또 숨길 때 이벤트를 다시 보낸다", () => {
+    const shown = nextArrivalHideStep(hiddenFor(), arrival, polledAt(seconds(40), 300), seconds(40));
+    expect(shown).toMatchObject({ hidden: false, hide: null });
+    const hiddenAgain = nextArrivalHideStep(shown.known, arrival, polledAt(seconds(235), 300), seconds(241));
+    expect(hiddenAgain.hidden).toBe(true);
+    expect(hiddenAgain.hide?.reason).toBe("walk_time");
+  });
+
+  it.each([
+    [
+      "ETA가 UNAVAILABLE",
+      (details: ReturnType<typeof detailsWith>) => {
+        const { eta } = details.resource.latestSuccess.body.routes[0]!.arrivals[0]!;
+        eta.status = "UNAVAILABLE";
+        eta.remainingSeconds = null;
+      },
+    ],
+    [
+      "노선과 응답이 UNAVAILABLE",
+      (details: ReturnType<typeof detailsWith>) => {
+        const { body } = details.resource.latestSuccess;
+        body.status = "UNAVAILABLE";
+        body.routes[0]!.status = "UNAVAILABLE";
+      },
+    ],
+    [
+      "routes가 빈 배열",
+      (details: ReturnType<typeof detailsWith>) => {
+        details.resource.latestSuccess.body.routes = [];
+      },
+    ],
+    [
+      "ETA 시각이 잘못됨",
+      (details: ReturnType<typeof detailsWith>) => {
+        details.resource.latestSuccess.body.routes[0]!.arrivals[0]!.eta.expectedArrivalAt = "invalid";
+      },
+    ],
+  ])("지나간 버스는 다음 폴링에서 %s이어도 숨긴 채로 둔다", (_, degrade) => {
+    const details = polledAt(seconds(40), 90);
+    degrade(details);
+    expect(nextArrivalHideStep(hiddenFor(), arrival, details, seconds(41))).toMatchObject({ hidden: true, hide: null });
+  });
+
+  it("snapshot이 만료된 뒤에도 숨긴다", () => {
+    const details = detailsWith(90);
+    details.resource.latestSuccess.body.snapshot!.staleAt = new Date(seconds(1)).toISOString();
+    expect(nextArrivalHideStep(null, arrival, details, seconds(31)).hide?.reason).toBe("walk_time");
+  });
+
+  it("차량이 바뀌면 이전 차량의 기억을 쓰지 않는다", () => {
+    const next = { ...arrival, vehicleId: "bus-2" };
+    const unknownEta = polledAt(seconds(40), 90);
+    expect(nextArrivalHideStep(hiddenFor(), next, unknownEta, seconds(41))).toEqual({
+      known: null,
+      hidden: false,
+      hide: null,
+    });
+    const nextEta = polledAt(seconds(40), 300);
+    nextEta.resource.latestSuccess.body.routes[0]!.arrivals[0]!.vehicleId = "bus-2";
+    expect(nextArrivalHideStep(hiddenFor(), next, nextEta, seconds(41))).toEqual({
+      known: { vehicleId: "bus-2", expectedArrivalAt: seconds(300), hidden: false },
+      hidden: false,
+      hide: null,
+    });
+  });
+
+  it("접었다가 다시 펼쳐 조회를 기다리는 동안 숨김을 유지하고 이벤트를 보내지 않는다", () => {
+    const collapsed = nextArrivalHideStep(hiddenFor(), arrival, null, null);
+    expect(collapsed).toMatchObject({ hidden: true, hide: null });
+    const pending = { ...detailsWith(90), resource: { status: "pending" as const } };
+    expect(nextArrivalHideStep(collapsed.known, arrival, pending, null)).toMatchObject({ hidden: true, hide: null });
+    expect(nextArrivalHideStep(collapsed.known, arrival, pending, seconds(100))).toMatchObject({
+      hidden: true,
+      hide: null,
+    });
+  });
+
+  it("차량 ID나 ETA가 전혀 없으면 폴링이 끊겨도 숨기지 않고 이벤트도 보내지 않는다", () => {
+    const silent = seconds(600);
+    const none = { known: null, hidden: false, hide: null };
+    const noRoutes = detailsWith(90);
+    noRoutes.resource.latestSuccess.body.routes = [];
+    const invalidEta = detailsWith(90);
+    invalidEta.resource.latestSuccess.body.routes[0]!.arrivals[0]!.eta.expectedArrivalAt = "invalid";
+
+    expect(nextArrivalHideStep(null, { ...arrival, vehicleId: null }, detailsWith(90), silent)).toEqual(none);
+    expect(nextArrivalHideStep(null, { ...arrival, vehicleId: "missing" }, detailsWith(90), silent)).toEqual(none);
+    expect(nextArrivalHideStep(null, undefined, detailsWith(90), silent)).toEqual(none);
+    expect(nextArrivalHideStep(null, arrival, noRoutes, silent)).toEqual(none);
+    expect(nextArrivalHideStep(null, arrival, invalidEta, silent)).toEqual(none);
+  });
+
+  it("이벤트의 마지막 폴링 시각은 브라우저 수신 시각이 아니라 서버 시계의 servedAt이다", () => {
+    const details = polledAt(seconds(10), 90);
+    details.resource.latestSuccess.receivedAt = seconds(25);
+    expect(nextArrivalHideStep(null, arrival, details, seconds(31)).hide).toEqual({
+      selection: details.selection,
+      vehicleId: "bus-1",
+      reason: "walk_time",
+      hiddenAt: seconds(31),
+      expectedArrivalAt: seconds(90),
+      lastPolledAt: seconds(10),
+    });
   });
 });
