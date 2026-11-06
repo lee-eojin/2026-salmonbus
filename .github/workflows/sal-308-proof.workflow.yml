@@ -1,0 +1,419 @@
+name: SAL-308-PROOF
+
+# Manual only. pull_request is intentionally NOT enabled.
+on:
+  workflow_dispatch:
+    inputs:
+      expect_migration_gap:
+        description: >-
+          When true (V49-only branch, V48 not yet on base), P3 treats exactly the two named
+          MigrationOrderTest failures as intentional. When false (V48 already on base),
+          P3 still runs MigrationOrderTest and requires PASS; only gap mode is N/A.
+        type: boolean
+        default: true
+      base_ref:
+        description: Diff / merge-base ref for P0 isolation (default origin/dev after checkout).
+        type: string
+        default: origin/dev
+
+# Optional trigger — leave commented:
+#  pull_request:
+#    branches: [ "dev", "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  BASELINE_OK: 438c7b96
+  FORBIDDEN: 8e7fc47e
+  MIG: backend/common/src/main/resources/db/migration
+  EXPECTED_MIG: V49__push_device.sql
+  P3_FAIL_A: 이_브랜치가_더하는_마이그레이션이_마지막_번호를_차지한다
+  P3_FAIL_B: 마이그레이션_번호에_빈_자리도_겹치는_자리도_없다
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # P0 — repo-relative isolation (once a proof branch exists).
+  # Env precheck is separate and is NOT copied here. Env precheck ≠ done proof.
+  # ---------------------------------------------------------------------------
+  p0_isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Fetch baseline and forbidden commits
+        run: |
+          git fetch --no-tags origin "${{ inputs.base_ref }}" || true
+          git fetch --no-tags origin "$BASELINE_OK" "$FORBIDDEN" || true
+
+      - name: P0 isolation checks
+        env:
+          BASE: ${{ inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          fails=0
+          pass() { printf 'PASS: %s\n' "$*"; }
+          fail() { printf 'FAIL: %s\n' "$*"; fails=$((fails + 1)); }
+
+          if git merge-base --is-ancestor "$BASELINE_OK" HEAD; then
+            pass "isolation ancestor $BASELINE_OK"
+          else
+            fail "isolation HEAD is not descendant of $BASELINE_OK"
+          fi
+
+          if git merge-base --is-ancestor "$FORBIDDEN" HEAD 2>/dev/null; then
+            fail "isolation HEAD descends from $FORBIDDEN (PR #247 must not leak)"
+          else
+            pass "isolation not-ancestor $FORBIDDEN"
+          fi
+
+          mig_status=$(git diff --name-status "${BASE}...HEAD" -- "$MIG" || true)
+          mig_expected_line=$(printf 'A\t%s/%s' "$MIG" "$EXPECTED_MIG")
+          if [[ -z "$mig_status" ]]; then
+            fail "migration empty diff under $MIG (expected only A $EXPECTED_MIG)"
+          elif [[ "$mig_status" == "$mig_expected_line" ]]; then
+            pass "migration only A $EXPECTED_MIG"
+          else
+            fail "migration unexpected name-status (want only A $EXPECTED_MIG)"
+            printf '%s\n' "$mig_status"
+          fi
+
+          fe_paths=$(git diff --name-only "${BASE}...HEAD" -- frontend app || true)
+          if [[ -z "$fe_paths" ]]; then
+            pass "no frontend/app paths in diff"
+          else
+            fail "frontend/app paths present"
+            printf '%s\n' "$fe_paths"
+          fi
+
+          mapfile -t comment_lines < <(git diff "${BASE}...HEAD" --unified=0 -- '*.java' '*.sql' | awk '
+            /^\+\+\+ b\// { file = substr($0, 7); next }
+            /^\+[[:space:]]*(\/\/|\/\*|\*|--)/ { print file "\t" substr($0, 2) }
+          ' || true)
+          comment_n=${#comment_lines[@]}
+          if [[ "$comment_n" -eq 1 && -z "${comment_lines[0]:-}" ]]; then
+            comment_n=0
+          fi
+          if [[ "$comment_n" -eq 0 ]]; then
+            pass "comment ban (0 hits on added java/sql lines)"
+          elif [[ "$comment_n" -eq 1 ]] && printf '%s\n' "${comment_lines[@]}" | grep -q 'MigrationOrderTest'; then
+            pass "comment ban (1 allowed MigrationOrderTest Javadoc hit)"
+          else
+            fail "comment ban hits=$comment_n (allow at most one MigrationOrderTest Javadoc)"
+            printf '%s\n' "${comment_lines[@]}"
+          fi
+
+          commit_count=$(git rev-list --count "${BASE}..HEAD" || echo 0)
+          if [[ "$commit_count" -ge 1 ]]; then
+            pass "commit_count=$commit_count"
+          else
+            fail "commit_count=0 (done-gate FAIL until impl commits exist)"
+          fi
+
+          echo "P0_FAILS=$fails" >> "$GITHUB_STEP_SUMMARY"
+          exit "$fails"
+
+  # ---------------------------------------------------------------------------
+  # P1 — unit / ArchUnit (no Docker required)
+  # ---------------------------------------------------------------------------
+  p1_unit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: P1 unit and ArchUnit
+        run: >-
+          ./gradlew :api-app:test --no-daemon
+          --tests '*ApiPackageBoundaryTest'
+          --tests '*DeviceTokenTest'
+          --tests '*PushEnvironmentTest'
+          --tests '*PushDeviceServiceTest'
+
+      - name: Upload P1 surefire
+        if: ${{ !cancelled() && hashFiles('backend/**/build/test-results/*/TEST-*.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sal308-p1-test-results
+          path: backend/**/build/test-results/*/TEST-*.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # P2 — API + contract (Testcontainers postgres:18; GHA runners have Docker)
+  # ---------------------------------------------------------------------------
+  p2_api_contract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Confirm Docker for Testcontainers
+        working-directory: .
+        run: docker info
+
+      - name: P2 API and contract tests
+        id: p2
+        shell: bash
+        run: >-
+          ./gradlew :api-app:test --no-daemon
+          --tests '*PushDeviceControllerTest'
+          --tests '*JdbcPushDeviceRepositoryTest'
+          --tests '*KakaoWithdrawalTest'
+          --tests '*LoginDisabledTest'
+          --tests '*AuthDisabledApiDocsTest'
+          --tests '*AuthApiDocsContractTest'
+          --tests '*WatchApiDocsContractTest'
+          2>&1 | tee /tmp/p2-gradle.log
+
+      - name: Extract postgres:18 boot hints from gradle log
+        if: ${{ !cancelled() }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          {
+            echo '## postgres:18 / Testcontainers log excerpt'
+            echo '```'
+            grep -E 'postgres:18|testcontainers|Container .* started|Pulling docker image|Creating container' /tmp/p2-gradle.log | head -n 80 || true
+            echo '```'
+            echo 'If empty: open the surefire XML / full job log and search for postgres:18.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload P2 surefire and gradle log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sal308-p2-test-results
+          path: |
+            backend/**/build/test-results/*/TEST-*.xml
+            /tmp/p2-gradle.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # P3 — MigrationOrderTest (SEPARATE from P2 and P4; never skipped after V48)
+  # V49-only / V48 gap: expect exactly the two named failures.
+  # V48 already merged: mode post-V48, failures=0 and Gradle exit=0 required.
+  # Only gap intentional-failure mode is N/A; the test/job remains mandatory.
+  # ---------------------------------------------------------------------------
+  p3_migration_order_expected:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Confirm Docker for Testcontainers
+        working-directory: .
+        run: docker info
+
+      # Preserve the actual failure: expected gap produces a RED job, not a green suite.
+      - name: Run MigrationOrderTest (preserve Gradle exit)
+        id: mot
+        run: |
+          set +e
+          set -o pipefail
+          ./gradlew :common:cleanTest :common:test --no-daemon --rerun-tasks --no-build-cache --info --tests '*MigrationOrderTest' 2>&1 | tee /tmp/p3-gradle.log
+          codes=("${PIPESTATUS[@]}")
+          echo "exit_code=${codes[0]}" >> "$GITHUB_OUTPUT"
+          if [[ "${codes[1]}" != "0" ]]; then
+            exit "${codes[1]}"
+          fi
+          exit "${codes[0]}"
+
+      - name: Verify execution, failure count, and exact failure names
+        if: ${{ always() && !cancelled() }}
+        env:
+          EXPECT_GAP: ${{ inputs.expect_migration_gap }}
+          GRADLE_EXIT: ${{ steps.mot.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          python3 - "$EXPECT_GAP" "$GRADLE_EXIT" "$P3_FAIL_A" "$P3_FAIL_B" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          expect_gap, gradle_exit, fail_a, fail_b = sys.argv[1:5]
+          if expect_gap not in {"true", "false"}:
+              raise SystemExit("FAIL: explicit expect_migration_gap boolean required")
+          mode = "gap" if expect_gap == "true" else "post-V48"
+          paths = list(Path("common/build/test-results/test").glob("TEST-*MigrationOrderTest.xml"))
+          if len(paths) != 1:
+              raise SystemExit(f"FAIL: expected one fresh MigrationOrderTest XML; got {paths}")
+          root = ET.parse(paths[0]).getroot()
+          cases = root.findall("testcase")
+          tests, skipped, failures, errors = (
+              int(root.attrib[key]) for key in ("tests", "skipped", "failures", "errors")
+          )
+          failed = [c.attrib.get("name", "") for c in cases if c.find("failure") is not None]
+          actual_errors = sum(c.find("error") is not None for c in cases)
+          actual_skipped = sum(c.find("skipped") is not None for c in cases)
+          # JUnit may render a method name with an empty invocation suffix. No fuzzy matching.
+          names = [n.removesuffix("()") for n in failed]
+          ran = tests > 0 and tests == len(cases) and skipped == actual_skipped == 0
+          evidence = dict(
+              mode=mode, ran="yes" if ran else "no", tests=tests, skipped=skipped,
+              failure_count=failures, failure_names=names, raw_failure_names=failed,
+              errors=errors, gradle_exit=gradle_exit,
+              container_ran="unverified: attach postgres:18 start log separately",
+              intentional_fail_mode="applicable" if mode == "gap" else "N/A",
+          )
+          line = json.dumps(evidence, ensure_ascii=False)
+          print(line)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("## P3 execution/count/names (container evidence separate)\n```json\n" + line + "\n```\n")
+          if not ran:
+              raise SystemExit("FAIL: tests missing, empty, skipped, or count inconsistent")
+          if tests != 4:
+              raise SystemExit(f"FAIL: expected all 4 MigrationOrderTest cases, got {tests}")
+          if errors != 0 or actual_errors != 0:
+              raise SystemExit("FAIL: test errors are not allowed")
+          if failures != len(failed):
+              raise SystemExit("FAIL: XML failure_count differs from failing testcase count")
+          if mode == "gap":
+              if failures != 2:
+                  raise SystemExit(f"FAIL: gap requires failure_count=2, got {failures} (unexpected pass forbidden)")
+              if sorted(names) != sorted([fail_a, fail_b]):
+                  raise SystemExit(f"FAIL: exact failure_names differ: {names}")
+              if gradle_exit != "1":
+                  raise SystemExit(f"FAIL: expected Gradle test-failure exit=1, got {gradle_exit}")
+              print("VERIFIED: ran=yes; failure_count=2; exact names match. Raw P3 job remains RED.")
+          else:
+              if failures != 0 or failed or gradle_exit != "0":
+                  raise SystemExit("FAIL: post-V48 MigrationOrderTest must PASS (failures=0, exit=0)")
+              print("PASS: post-V48 MigrationOrderTest ran; gap intentional-fail mode only is N/A.")
+          PY
+
+      - name: Upload P3 surefire and gradle log
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sal308-p3-migration-order
+          path: |
+            backend/common/build/test-results/**/TEST-*.xml
+            /tmp/p3-gradle.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # P4 — clean build with V48 present strategy
+  # Same command as backend-ci.yml: ./gradlew clean build --continue --no-daemon
+  # Assumes the checked-out branch already includes V48 (after merge or after
+  # a proof branch that added V48). Do not invent checkout secrets or remote tokens.
+  # If the proof branch is still V49-only, run this job on a later SHA that includes
+  # V48, or use a dedicated proof branch that already has V48.
+  # ---------------------------------------------------------------------------
+  p4_clean_build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Require V48 migration present (P4 prerequisite)
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if ls "$MIG"/V48__*.sql >/dev/null 2>&1; then
+            echo "PASS: V48 present"
+            ls -1 "$MIG"/V48__*.sql
+          else
+            echo "FAIL: V48 not present on this SHA — P4 clean build is for the V48-present strategy"
+            echo "Do not invent tokens to fetch other PRs. Use a branch that already includes V48,"
+            echo "or wait until V48 merges to the base, then re-run."
+            exit 1
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Confirm Docker for Testcontainers
+        working-directory: .
+        run: docker info
+
+      - name: Clean build (same as backend-ci)
+        run: ./gradlew clean build --continue --no-daemon
+
+      - name: Publish test report
+        if: ${{ !cancelled() && hashFiles('backend/**/build/test-results/*/TEST-*.xml') != '' }}
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: 'backend/**/build/test-results/*/TEST-*.xml'
+          annotate_only: true
+          check_name: 'SAL-308 P4 테스트 결과'
+          detailed_summary: true
+
+      - name: Upload P4 test results
+        if: ${{ !cancelled() && hashFiles('backend/**/build/test-results/*/TEST-*.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sal308-p4-test-results
+          path: backend/**/build/test-results/*/TEST-*.xml
+          retention-days: 7
