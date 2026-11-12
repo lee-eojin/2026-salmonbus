@@ -500,34 +500,32 @@
 
 광역버스는 자리가 다 차면 정류장에서 기다리던 사람을 태우지 못하고 지나갑니다. 연어버스는 버스가 내 정류장에 도착할 때의 좌석을 예상해서, 집을 나서기 전에 탈 수 있는지 알려 줍니다. 화면에는 "도착 시 3석 예상해요", "도착 시 빈자리가 없어요"처럼 나옵니다.
 
-| 화면 | 알려 주는 것 |
-|---|---|
-| 판정보드 | 정류장마다 탑승 확률과 도착 예상 좌석을 보여 줍니다. |
-| 검색 | 버스 번호를 입력하면 그 노선의 탑승 확률을 볼 수 있습니다. |
-| 노선도 | 지도에서 노선과 정류장을 봅니다. |
-| 즐겨찾기 | 로그인하면 자주 타는 노선과 정류장을 내 그룹에 모아 둡니다. |
+<table>
+<tr><td align="center"><img src="docs/readme-play/screens/home.png" width="380" alt="홈: 지도에서 가까운 정류장을 찾는 화면"></td><td align="center"><img src="docs/readme-play/screens/search.png" width="380" alt="노선 검색: 버스 번호로 노선을 찾는 화면"></td></tr>
+<tr><td align="center"><b>홈 화면</b></td><td align="center"><b>노선 검색</b></td></tr>
+<tr><td align="center"><img src="docs/readme-play/screens/route-map.png" width="380" alt="노선도: 서비스 중인 노선을 지도에서 보는 화면"></td><td align="center"><img src="docs/readme-play/screens/board.png" width="380" alt="판정보드: 정류장마다 탑승 확률과 도착 예상 좌석을 보는 화면"></td></tr>
+<tr><td align="center"><b>노선도</b></td><td align="center"><b>판정보드</b></td></tr>
+</table>
+
+로그인하면 자주 타는 노선과 정류장을 즐겨찾기 그룹에 모아 둘 수 있습니다.
 
 ## 기술 스택
 
-### Frontend
+### Frontend & App (iOS)
 
-![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white) ![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB) ![React Router](https://img.shields.io/badge/React_Router-CA4245?style=for-the-badge&logo=reactrouter&logoColor=white) ![vanilla-extract](https://img.shields.io/badge/vanilla--extract-F786AD?style=for-the-badge&logo=vanillaextract&logoColor=black) ![webpack](https://img.shields.io/badge/webpack-8DD6F9?style=for-the-badge&logo=webpack&logoColor=black) ![Jest](https://img.shields.io/badge/Jest-C21325?style=for-the-badge&logo=jest&logoColor=white) ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?style=for-the-badge) ![Storybook](https://img.shields.io/badge/Storybook-FF4785?style=for-the-badge&logo=storybook&logoColor=white) ![Sentry](https://img.shields.io/badge/Sentry-362D59?style=for-the-badge&logo=sentry&logoColor=white) ![Amplitude](https://img.shields.io/badge/Amplitude-1E61F0?style=for-the-badge)
-
-### App (iOS)
-
-![Expo](https://img.shields.io/badge/Expo-000020?style=for-the-badge&logo=expo&logoColor=white) ![React Native](https://img.shields.io/badge/React_Native-20232A?style=for-the-badge&logo=react&logoColor=61DAFB) ![APNs](https://img.shields.io/badge/APNs-555555?style=for-the-badge&logo=apple&logoColor=white)
+<img src="docs/readme-play/stack/frontend.png" width="830" alt="TypeScript 6, React 19, React Router 8, vanilla-extract, webpack 5, Jest 30, Playwright, Storybook 10, Sentry, Amplitude, Expo 57, React Native 0.86, APNs">
 
 ### Backend
 
-![Java 21](https://img.shields.io/badge/Java_21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white) ![Spring Boot](https://img.shields.io/badge/Spring_Boot-6DB33F?style=for-the-badge&logo=springboot&logoColor=white) ![Spring Security](https://img.shields.io/badge/Spring_Security-6DB33F?style=for-the-badge&logo=springsecurity&logoColor=white) ![Spring Data JPA](https://img.shields.io/badge/Spring_Data_JPA-6DB33F?style=for-the-badge&logo=spring&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white) ![Flyway](https://img.shields.io/badge/Flyway-CC0200?style=for-the-badge&logo=flyway&logoColor=white) ![JUnit](https://img.shields.io/badge/JUnit-25A162?style=for-the-badge&logo=junit5&logoColor=white) ![Testcontainers](https://img.shields.io/badge/Testcontainers-17A6B2?style=for-the-badge) ![Micrometer](https://img.shields.io/badge/Micrometer-1AA7A4?style=for-the-badge) ![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white) ![Grafana Alloy](https://img.shields.io/badge/Grafana_Alloy-F46800?style=for-the-badge&logo=grafana&logoColor=white) ![Grafana](https://img.shields.io/badge/Grafana-F46800?style=for-the-badge&logo=grafana&logoColor=white) ![Loki](https://img.shields.io/badge/Loki-F46800?style=for-the-badge&logo=grafana&logoColor=white)
+<img src="docs/readme-play/stack/backend.png" width="830" alt="Java 21, Spring Boot 4.1, Spring Security, Spring Data JPA, PostgreSQL 18, Flyway, JUnit, Testcontainers, Micrometer, Prometheus, Grafana Alloy, Grafana, Loki">
 
 ### Infrastructure & CI/CD
 
-![Amazon EC2](https://img.shields.io/badge/Amazon_EC2-FF9900?style=for-the-badge) ![Amazon RDS](https://img.shields.io/badge/Amazon_RDS-527FFF?style=for-the-badge) ![Amazon S3](https://img.shields.io/badge/Amazon_S3-569A31?style=for-the-badge) ![Amazon CloudFront](https://img.shields.io/badge/Amazon_CloudFront-8C4FFF?style=for-the-badge) ![AWS CodePipeline](https://img.shields.io/badge/AWS_CodePipeline-232F3E?style=for-the-badge) ![AWS CodeBuild](https://img.shields.io/badge/AWS_CodeBuild-232F3E?style=for-the-badge) ![AWS CodeDeploy](https://img.shields.io/badge/AWS_CodeDeploy-232F3E?style=for-the-badge) ![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+<img src="docs/readme-play/stack/infrastructure.png" width="830" alt="Amazon EC2, Amazon RDS, Amazon S3, CloudFront, CodePipeline, CodeBuild, CodeDeploy, GitHub Actions, Docker">
 
 ### Collaboration
 
-![Jira](https://img.shields.io/badge/Jira-0052CC?style=for-the-badge&logo=jira&logoColor=white) ![Confluence](https://img.shields.io/badge/Confluence-172B4D?style=for-the-badge&logo=confluence&logoColor=white)
+<img src="docs/readme-play/stack/collaboration.png" width="830" alt="Jira, Confluence">
 
 <details>
 <summary>기술 스택 전체 목록</summary>
