@@ -1,10 +1,10 @@
-# 연어버스
+<h1 align="center"><a href="https://www.salmonbus.com">연어버스 사용하러가기</a></h1>
+
+### [연어버스를 소개합니다!](https://salmonbus-landing.vercel.app/__preview/landing)
 
 빨간 버스 탑승 확률을 한눈에. 기다림에 확신을.
 
 연어버스는 경기도 광역버스가 내 정류장에 도착할 때 자리가 몇 석 남을지 미리 알려 주는 서비스입니다.
-
-**[www.salmonbus.com](https://www.salmonbus.com)**
 
 ## 오늘은 늦지 않게 출근할 수 있을까?
 
@@ -183,6 +183,8 @@
 
 </details>
 
+<br>
+
 </details>
 
 <details>
@@ -336,6 +338,8 @@
 </details>
 
 </details>
+
+<br>
 
 </details>
 
@@ -494,7 +498,12 @@
 
 </details>
 
+<br>
+
 </details>
+
+<br>
+<br>
 
 ## 연어버스가 알려 주는 것
 
@@ -503,8 +512,8 @@
 <table>
 <tr><td align="center"><img src="docs/readme-play/screens/home.png" width="380" alt="홈: 지도에서 가까운 정류장을 찾는 화면"></td><td align="center"><img src="docs/readme-play/screens/search.png" width="380" alt="노선 검색: 버스 번호로 노선을 찾는 화면"></td></tr>
 <tr><td align="center"><b>홈 화면</b></td><td align="center"><b>노선 검색</b></td></tr>
-<tr><td align="center"><img src="docs/readme-play/screens/route-map.png" width="380" alt="노선도: 서비스 중인 노선을 지도에서 보는 화면"></td><td align="center"><img src="docs/readme-play/screens/board.png" width="380" alt="판정보드: 정류장마다 탑승 확률과 도착 예상 좌석을 보는 화면"></td></tr>
-<tr><td align="center"><b>노선도</b></td><td align="center"><b>판정보드</b></td></tr>
+<tr><td align="center"><img src="docs/readme-play/screens/route-map.png" width="380" alt="노선도: 서비스 중인 노선을 지도에서 보는 화면"></td><td align="center"><img src="docs/readme-play/screens/board.png" width="380" alt="노선 상세 페이지: 정류장마다 탑승 확률과 도착 예상 좌석을 보는 화면"></td></tr>
+<tr><td align="center"><b>노선도</b></td><td align="center"><b>노선 상세 페이지</b></td></tr>
 </table>
 
 로그인하면 자주 타는 노선과 정류장을 즐겨찾기 그룹에 모아 둘 수 있습니다.
@@ -601,9 +610,9 @@
 
 | 구분 | 기술 |
 |---|---|
-| 일감과 문서 | Jira, Confluence |
+| 티켓과 문서 | Jira, Confluence |
 
-- 일감은 **Jira**에서, 문서는 **Confluence**에서 관리합니다.
+- 티켓은 **Jira**에서, 문서는 **Confluence**에서 관리합니다.
 
 </details>
 
@@ -632,4 +641,4 @@ Docker Desktop이 있는 Apple Silicon 맥에서 저장소 루트의 명령 하�
 
 | [<img src="https://github.com/lee-eojin.png" width="96" alt=""><br>레스](https://github.com/lee-eojin) | [<img src="https://github.com/bigcloud07.png" width="96" alt=""><br>루멘](https://github.com/bigcloud07) | [<img src="https://github.com/korogoo.png" width="96" alt=""><br>코로구](https://github.com/korogoo) | [<img src="https://github.com/DongKey777.png" width="96" alt=""><br>동키](https://github.com/DongKey777) |
 |:---:|:---:|:---:|:---:|
-| 프런트엔드 | 프런트엔드 | 백엔드 | 백엔드 |
+| Frontend | Frontend | Backend | Backend |
