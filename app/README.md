@@ -1,6 +1,6 @@
 # 연어버스 앱
 
-웹 UI는 `react-native-webview`에서 실행합니다. iOS development/release build는 로컬 Expo module의 네이버 iOS SDK 지도를 사용하며, Bottom Sheet와 목록은 기존 웹 컴포넌트를 유지합니다. 브라우저, Android와 native module이 없는 Expo Go는 기존 네이버 JavaScript SDK를 사용합니다.
+웹 UI는 `react-native-webview`에서 실행합니다. 현재 iOS development/release build는 홈·노선도·즐겨찾기·판정보드 지도를 로컬 Expo module의 네이버 iOS SDK로 그립니다. Bottom Sheet와 목록은 웹 컴포넌트로 유지합니다. 브라우저, Android, Expo Go는 네이버 JavaScript SDK를 사용합니다. 홈 지도 명령을 제공하기 전의 iOS 빌드는 판정보드에 네이티브 지도를 사용합니다.
 
 ## 로컬 실행
 
@@ -54,15 +54,19 @@ Simulator에서는 아래 payload를 파일로 저장하고 `xcrun simctl push b
 
 웹은 API 요청과 선택 state를 유지합니다. native는 관측마다 받은 차량 이동 경로를 `CADisplayLink`로 보간하며, 매 프레임 WebView bridge를 통과하지 않습니다. 시트가 움직이는 동안 새 지도 touch를 막고 최종 영역을 적용한 뒤 다시 허용합니다. 이미 시작한 touch는 UIKit이 처음 정한 view에 남습니다.
 
+지도 위에서 웹이 터치를 받아야 하는 요소는 `data-native-map-hit` 영역 안에 둡니다. 그 영역의 사각형이 `map.layout`으로 앱에 전달됩니다. 검색창이나 시트처럼 기존 영역 바깥에 버튼을 추가하면 버튼에 이 속성을 붙이고, 앱에서 눌렀을 때 웹 동작이 시작되는지 확인합니다.
+
+홈 지도는 `map.mountHome`으로 세션을 열고 `map.updateHome`으로 바뀐 정류장, 노선, 위치만 보냅니다. iOS가 카메라 이동을 마치면 `map.homeViewport`로 중심·줌·방향과 화면 네 모서리의 좌표를 전달합니다. 웹은 좌표 범위로 정류장 타일을 조회하고, `map.homeStopPress`를 받아 정류장 시트를 엽니다. 판정보드 데이터가 준비되면 판정보드 세션이 같은 지도 뷰를 사용하고, 닫으면 홈에서 마지막으로 본 카메라를 복원합니다.
+
 iOS의 뒤로가기·앞으로가기 스와이프 중에는 `MapNavigationSnapshot.swift`가 지도 캡처를 WebView의 scroll view 안에 잠시 넣어 웹과 함께 움직이게 합니다. 이동 가능한 이력이 있는 화면 가장자리 20pt는 WebView가 받으며, 전환 완료·취소·앱 백그라운드 진입 시 캡처를 정리합니다. 제스처 종료 후 WebKit이 scroll view를 원래 부모로 돌려주지 않더라도 1초가 지나면 캡처를 정리하고 실제 지도를 복구합니다. iOS/WebKit 업데이트 시 완료와 취소를 함께 확인합니다.
 
 `pnpm test`, `pnpm typecheck`, `pnpm lint`로 config plugin, bridge, TypeScript를 검사합니다. Swift와 SDK 연동은 Xcode Simulator build로 검사합니다. DEBUG build의 `[SalmonNativeMap]` 로그는 touch 대상, camera 이동 여부와 zoom, overlay 개수만 기록하며 클라이언트 키나 사용자 좌표를 기록하지 않습니다.
 
-`verification/NativeMapInteractionTests.swift`는 검색 화면에서 가상 3330 노선을 선택해 전체 경로가 상태바 안전 영역과 웹 시트 사이에 들어오는지, iOS 26 이상의 WebView 상단 효과가 지도를 흐리게 덮지 않는지, 지도 이동·시트 드래그·더블탭 확대가 동작하는지 확인합니다. 저장소의 `scripts/native-map-fixture-api.cjs`를 실행하고 웹 개발 서버의 `API_PROXY_TARGET`을 그 서버로 지정합니다. 앱의 `EXPO_PUBLIC_WEB_URL`은 웹 개발 서버의 `/search`로 설정하고, `verification/setup-ui-tests.rb`로 만든 `NativeMapVerification` scheme을 전용 iOS Simulator에서 실행합니다.
+`verification/NativeMapInteractionTests.swift`는 검색 화면에서 가상 3330 노선을 선택해 전체 경로가 상태바 안전 영역과 웹 시트 사이에 들어오는지, iOS 26 이상의 WebView 상단 효과가 지도를 흐리게 덮지 않는지, 지도 이동·시트 드래그·더블탭 확대가 동작하는지 확인합니다. 회전 후 핀치 확대와 가상 노선 재진입에서 방향 초기화 및 카메라 보존도 검증합니다. 저장소의 `scripts/native-map-fixture-api.cjs`를 실행하고 웹 개발 서버의 `API_PROXY_TARGET`을 그 서버로 지정합니다. 앱의 `EXPO_PUBLIC_WEB_URL`은 웹 개발 서버의 `/api/native-map-verification`으로 설정하고, `verification/setup-ui-tests.rb`로 만든 `NativeMapVerification` scheme을 전용 iOS Simulator에서 실행합니다.
 
-마커 UI의 기준은 `frontend/src/pages/verdict-board/map/RouteMap.css.ts`와 `naverMapAdapter.ts`입니다. iOS의 `MapMarkerImages.swift`가 같은 치수·색상·글꼴로 이미지를 만들며, 정류장은 웹과 같은 원형 링(승차 가능)·점(경유)으로 직접 그립니다. `ios/Resources`의 버스 3x PNG는 웹의 원본 SVG에서 변환한 아이콘이므로 버스 아이콘 원본을 바꾸면 PNG도 함께 갱신합니다.
+마커 UI의 기준은 `frontend/src/shared/map/mapStopPin.css.ts`와 `naverMapAdapter.css.ts`입니다. iOS 정류장 핀은 이 웹 스타일로 렌더링한 `ios/Resources/stop-*@3x.png` 네 가지를 사용합니다. 승차 가능 여부와 선택 상태에 맞춰 이미지를 고릅니다. 웹 정류장 핀 스타일을 바꿀 때는 18px 핀을 기존 36px 또는 44px 투명 캔버스 중앙에 놓고 3배 해상도로 다시 렌더링합니다. 실시간 차량은 별도의 `bus-front@3x.png`를 사용합니다.
 
-`verification/MapMarkerImageChecks.swift`는 UIKit에서 정류장 8개 상태, 좌석 배지의 크기·중첩·줌아웃 상태를 검증하고 `/tmp/salmonbus-map-marker-preview.png`를 만듭니다. 부팅된 Apple Silicon iOS Simulator에서 `app` 디렉터리를 기준으로 실행합니다.
+`verification/MapMarkerImageChecks.swift`는 UIKit에서 정류장 핀 4개의 크기와 버스 그림의 픽셀 중심, 좌석 배지의 크기·중첩·줌아웃 상태를 검증하고 `/tmp/salmonbus-map-marker-preview.png`를 만듭니다. 부팅된 Apple Silicon iOS Simulator에서 `app` 디렉터리를 기준으로 실행합니다.
 
 ```sh
 mkdir -p /tmp/SalmonMarkerChecks.app

@@ -2,13 +2,16 @@ package com.gustler.backend.forecasting.infrastructure.jdbc;
 
 import static com.gustler.backend.forecasting.domain.model.alighting.AlightingAwareIdentifiers.canonical;
 
+import com.gustler.backend.diagnostics.WorkerOperationLog;
+import com.gustler.backend.forecasting.application.AfterCommitTelemetry;
 import com.gustler.backend.forecasting.application.RouteWorkAccess;
 import com.gustler.backend.forecasting.application.evaluation.AlightingAwareForecastEvaluation;
 import com.gustler.backend.forecasting.application.evaluation.SettlementRouteRunner;
-import com.gustler.backend.forecasting.domain.model.alighting.AlightingPosterior;
 import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwareObservation;
 import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwarePassEvent;
 import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwarePassEvents;
+import com.gustler.backend.forecasting.domain.model.alighting.AlightingPosterior;
+import com.gustler.backend.forecasting.infrastructure.ReadWorkBudget;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -29,14 +32,19 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BinaryOperator;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -48,6 +56,7 @@ import tools.jackson.databind.json.JsonMapper;
 @Component
 @ConditionalOnProperty(prefix = "forecast", name = "enabled", havingValue = "true")
 public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForecastEvaluation {
+    private static final Logger LOGGER = LoggerFactory.getLogger(JdbcAlightingAwareForecastEvaluation.class);
     private static final ZoneId SEOUL = ZoneId.of("Asia/Seoul");
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final String VERSION = "alighting-capacity-snapshot-v2";
@@ -57,12 +66,17 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         LocalDate.parse("2026-10-05"), LocalDate.parse("2026-10-09"));
     private static final int PAGE_SIZE = 100;
     private final int pendingLimit;
+    private final int preparationLimit;
+    private final int maximumPreparations;
+    private final int maximumTickSeconds;
+    private final AtomicLong lastRoute = new AtomicLong(Long.MIN_VALUE);
     private final int observationLimit;
     private final int confirmedObservationLimit;
     private final JdbcClient jdbc;
     private final RouteWorkAccess routeWork;
     private final Clock clock;
     private final SettlementRouteRunner routeRunner;
+    private final TransactionTemplate preparation;
     private final TransactionTemplate transaction;
 
     public JdbcAlightingAwareForecastEvaluation(
@@ -95,7 +109,6 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         this(jdbc, routeWork, clock, transactions, observationLimit, confirmedObservationLimit, 3000);
     }
 
-    @Autowired
     public JdbcAlightingAwareForecastEvaluation(
         JdbcClient jdbc,
         RouteWorkAccess routeWork,
@@ -105,6 +118,28 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         @Value("${forecast.alighting.causal-evaluation.maximum-observation-rows:150000}") final int confirmedObservationLimit,
         @Value("${forecast.pending-limit:3000}") final int pendingLimit
     ) {
+        this(jdbc, routeWork, clock, transactions, observationLimit, confirmedObservationLimit, pendingLimit,
+            500, 8, 30);
+    }
+
+    @Autowired
+    public JdbcAlightingAwareForecastEvaluation(
+        JdbcClient jdbc, RouteWorkAccess routeWork, Clock clock, PlatformTransactionManager transactions,
+        @Value("${forecast.alighting.evaluation.maximum-observation-rows:50000}") int observationLimit,
+        @Value("${forecast.alighting.causal-evaluation.maximum-observation-rows:150000}") int confirmedObservationLimit,
+        @Value("${forecast.pending-limit:3000}") int pendingLimit,
+        @Value("${forecast.alighting.evaluation.preparation-limit:500}") int preparationLimit,
+        @Value("${forecast.alighting.evaluation.maximum-preparations-per-tick:8}") int maximumPreparations,
+        @Value("${forecast.alighting.evaluation.maximum-tick-seconds:30}") int maximumTickSeconds
+    ) {
+        if (preparationLimit < PAGE_SIZE || preparationLimit > 3000
+            || maximumPreparations < 1 || maximumPreparations > 1000
+            || maximumTickSeconds < 1 || maximumTickSeconds > 3600) {
+            throw new IllegalArgumentException("Invalid settlement read budget");
+        }
+        this.preparationLimit = preparationLimit;
+        this.maximumPreparations = maximumPreparations;
+        this.maximumTickSeconds = maximumTickSeconds;
         if (pendingLimit < 1 || pendingLimit > 100_000) {
             throw new IllegalArgumentException("AlightingAware 회차별 처리 예산은 1~100000개여야 한다");
         }
@@ -121,6 +156,10 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         this.routeWork = routeWork;
         this.clock = clock;
         this.routeRunner = new SettlementRouteRunner(clock, "alighting_settlement_route");
+        this.preparation = new TransactionTemplate(transactions);
+        this.preparation.setReadOnly(true);
+        this.preparation.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        this.preparation.setTimeout(15);
         this.transaction = new TransactionTemplate(transactions);
         this.transaction.setTimeout(15);
     }
@@ -129,54 +168,165 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
     public void settle() {
         // 다음 시각으로 순환하므로 아직 도착하지 않은 오래된 예보가 뒤의 예보를 막지 않는다.
         List<Long> routes = jdbc.sql("""
-            SELECT DISTINCT route_version_id FROM alighting_forecast_evaluation_work
-            WHERE next_attempt_at<=clock_timestamp() ORDER BY route_version_id
+            SELECT version.id
+            FROM route_version version
+            JOIN LATERAL (
+                SELECT 1
+                FROM alighting_forecast_evaluation_work work
+                WHERE work.route_version_id = version.id
+                  AND work.next_attempt_at <= statement_timestamp()
+                ORDER BY work.next_attempt_at, work.vehicle_observation_id, work.target_stop_order, work.target_kind
+                LIMIT 1
+            ) due ON true
+            ORDER BY version.id
             """).query(Long.class).list();
-        routeRunner.run(routes, this::settleRoutePages);
+        ReadWorkBudget budget = new ReadWorkBudget(maximumPreparations, Duration.ofSeconds(maximumTickSeconds));
+        long after = lastRoute.get();
+        List<Long> ordered = new ArrayList<>(routes.size());
+        routes.stream().filter(route -> route > after).forEach(ordered::add);
+        routes.stream().filter(route -> route <= after).forEach(ordered::add);
+        routeRunner.run(ordered, route -> {
+            lastRoute.set(route);
+            settleRoutePages(route, budget);
+        }, budget::available);
     }
 
-    private void settleRoutePages(final long route) {
+    private void settleRoutePages(final long route, ReadWorkBudget budget) {
         int remaining = pendingLimit;
         Instant dueThrough = jdbc.sql("SELECT clock_timestamp()")
             .query(OffsetDateTime.class).single().toInstant();
-        while (remaining > 0) {
-            final int pageLimit = Math.min(PAGE_SIZE, remaining);
-            Integer processed = transaction.execute(status -> settleRoute(route, pageLimit, dueThrough));
-            if (processed == null || processed < pageLimit) {
+        while (remaining > 0 && budget.tryAcquire()) {
+            final int readLimit = Math.min(preparationLimit, remaining);
+            PreparedPage page = WorkerOperationLog.measure("alighting_settlement_prepare", route,
+                () -> preparation.execute(status -> preparePage(route, readLimit, dueThrough)));
+            if (page == null || page.work().isEmpty()) {
                 return;
             }
-            remaining -= processed;
+            int preparedRemaining = page.work().size();
+            while (preparedRemaining > 0) {
+                final int writeLimit = Math.min(PAGE_SIZE, preparedRemaining);
+                Integer processed = WorkerOperationLog.measure("alighting_settlement_commit", route,
+                    () -> transaction.execute(status -> writePage(route, writeLimit, dueThrough, page)));
+                if (processed == null || processed < writeLimit) {
+                    return;
+                }
+                preparedRemaining -= processed;
+                remaining -= processed;
+            }
+            if (!page.moreWork()) {
+                return;
+            }
         }
     }
 
-    private int settleRoute(final long route, final int limit, Instant dueThrough) {
-        final long revision = routeWork.lock(route);
-        Instant now = clock.instant();
-        List<Work> work = readWork(route, limit, dueThrough);
+    private PreparedPage preparePage(final long route, final int limit, Instant dueThrough) {
+        final long revision = routeWork.current(route);
+        final Instant now = clock.instant();
+        List<Work> selected = readWork(route, limit, dueThrough, false);
+        List<Work> work = preparationScope(selected);
+        boolean moreWork = selected.size() == limit || work.size() < selected.size();
+        Map<Work, Outcome> outcomes = new HashMap<>();
         Map<LocalDate, List<Work>> days = work.stream().collect(Collectors.groupingBy(w -> day(w.observedAt())));
         for (Map.Entry<LocalDate, List<Work>> entry : days.entrySet()) {
-            settleDay(route, revision, now, entry.getKey(), entry.getValue());
+            prepareDay(route, now, entry.getKey(), entry.getValue(), outcomes);
         }
-        return work.size();
+        return new PreparedPage(revision, now, work, outcomes, moreWork);
     }
 
-    private void settleDay(
-        final long route,
-        final long revision,
-        Instant now,
-        LocalDate date,
-        List<Work> work
-    ) {
-        settleConfirmedDay(route, revision, now, date, work);
-        work = work.stream().filter(item -> !canonical(item.version()).equals("alighting-confirmed-capacity-snapshot-v3")).toList();
+    private static List<Work> preparationScope(List<Work> work) {
         if (work.isEmpty()) {
+            return work;
+        }
+        if (work.stream().anyMatch(item -> !isConfirmed(item))) {
+            return work.subList(0, Math.min(PAGE_SIZE, work.size()));
+        }
+        LocalDate date = day(work.getFirst().observedAt());
+        int end = 1;
+        while (end < work.size() && day(work.get(end).observedAt()).equals(date)) {
+            end++;
+        }
+        return work.subList(0, end);
+    }
+
+    private int writePage(
+        final long route,
+        final int limit,
+        Instant dueThrough,
+        PreparedPage page
+    ) {
+        if (routeWork.lock(route) != page.revision()) {
+            return 0;
+        }
+        List<Work> locked = readWork(route, limit, dueThrough, true);
+        Map<LocalDate, Instant> preparedLegacyHorizons = legacyHorizons(page.work(), page.now());
+        Map<LocalDate, Instant> lockedLegacyHorizons = legacyHorizons(locked, page.now());
+        int processed = 0;
+        int completed = 0;
+        for (Work item : locked) {
+            if (!page.outcomes().containsKey(item)) {
+                continue;
+            }
+            LocalDate date = day(item.observedAt());
+            // 이전 판본은 같은 날짜의 작업 중 가장 늦은 시각까지의 관측을 함께 쓴다.
+            if (!isConfirmed(item)
+                && !Objects.equals(preparedLegacyHorizons.get(date), lockedLegacyHorizons.get(date))) {
+                continue;
+            }
+            writeOutcome(item, page);
+            processed++;
+            if (page.outcomes().get(item) != null
+                || Duration.between(item.observedAt(), page.now()).compareTo(Duration.ofHours(2)) > 0) {
+                completed++;
+            }
+        }
+        int committedProcessed = processed;
+        int committedCompleted = completed;
+        AfterCommitTelemetry.record(() -> LOGGER.info(
+            "event=alighting_settlement_page_committed routeVersionId={} processed={} completed={} deferred={}",
+            route, committedProcessed, committedCompleted, committedProcessed - committedCompleted));
+        return processed;
+    }
+
+    private void writeOutcome(Work item, PreparedPage page) {
+        Outcome outcome = page.outcomes().get(item);
+        if (outcome == null) {
+            defer(item, page.revision(), page.now(), "NO_CLOSED_IDENTITY_SAFE_PASS");
             return;
         }
-        Instant through = work.stream().map(w -> w.observedAt().plusSeconds(7200))
-            .max(Instant::compareTo).orElse(now);
-        if (through.isAfter(now)) {
-            through = now;
+        finish(item, page.revision(), page.now(), outcome);
+    }
+
+    private static Map<LocalDate, Instant> legacyHorizons(List<Work> work, Instant now) {
+        return work.stream()
+            .filter(item -> !isConfirmed(item))
+            .collect(Collectors.toMap(
+                item -> day(item.observedAt()),
+                item -> evaluationThrough(item, now),
+                BinaryOperator.maxBy(Instant::compareTo)));
+    }
+
+    private static boolean isConfirmed(Work work) {
+        return canonical(work.version()).equals("alighting-confirmed-capacity-snapshot-v3");
+    }
+
+    private void prepareDay(
+        final long route,
+        Instant now,
+        LocalDate date,
+        List<Work> work,
+        Map<Work, Outcome> outcomes
+    ) {
+        prepareConfirmedDay(route, now, date, work, outcomes);
+        List<Work> legacyWork = work.stream()
+            .filter(item -> !isConfirmed(item))
+            .toList();
+        if (legacyWork.isEmpty()) {
+            return;
         }
+        Instant through = legacyWork.stream()
+            .map(item -> evaluationThrough(item, now))
+            .max(Instant::compareTo)
+            .orElseThrow();
         List<Evidence> evidence = readObservations(route, date, through);
         final boolean inputLimit = evidence.size() > observationLimit;
         String sourceProblem = null;
@@ -185,28 +335,33 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         }
         Map<Long, Evidence> byId = evidence.stream().collect(Collectors.toMap(e -> e.row().observationId(), e -> e));
         Map<List<Integer>, List<AlightingAwarePassEvent>> eventCache = new HashMap<>();
-        for (Work item : work) {
-            settleWork(item, revision, now, evidence, byId, eventCache, inputLimit, sourceProblem);
+        for (Work item : legacyWork) {
+            outcomes.put(item, evaluateWork(item, evidence, byId, eventCache, inputLimit, sourceProblem));
         }
     }
 
-    /** 관측 목록은 같은 조회 상한을 쓰는 묶음에서만 보관하고 다음 묶음으로 넘기지 않는다. */
-    private void settleConfirmedDay(
+    private void prepareConfirmedDay(
         final long route,
-        final long revision,
         Instant now,
         LocalDate date,
-        List<Work> work
+        List<Work> work,
+        Map<Work, Outcome> outcomes
     ) {
         Map<Instant, List<Work>> workByHorizon = work.stream()
-            .filter(item -> canonical(item.version()).equals("alighting-confirmed-capacity-snapshot-v3"))
-            .collect(Collectors.groupingBy(item -> confirmedThrough(item, now)));
+            .filter(JdbcAlightingAwareForecastEvaluation::isConfirmed)
+            .collect(Collectors.groupingBy(item -> evaluationThrough(item, now)));
+        if (workByHorizon.isEmpty()) {
+            return;
+        }
+        Instant latest = workByHorizon.keySet().stream().max(Instant::compareTo).orElseThrow();
+        ConfirmedAlightingAwareEvaluation.History history = new ConfirmedAlightingAwareEvaluation.History(
+            jdbc, route, date, latest, confirmedObservationLimit);
         for (Map.Entry<Instant, List<Work>> entry : workByHorizon.entrySet()) {
-            settleConfirmedGroup(route, revision, now, date, entry.getKey(), entry.getValue());
+            prepareConfirmedGroup(history, date, entry.getKey(), entry.getValue(), outcomes);
         }
     }
 
-    private Instant confirmedThrough(Work work, Instant now) {
+    private static Instant evaluationThrough(Work work, Instant now) {
         Instant through = work.observedAt().plusSeconds(7200);
         if (through.isAfter(now)) {
             return now;
@@ -214,66 +369,92 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         return through;
     }
 
-    private void settleConfirmedGroup(
-        final long route,
-        final long revision,
-        Instant now,
+    private void prepareConfirmedGroup(
+        ConfirmedAlightingAwareEvaluation.History history,
         LocalDate date,
         Instant through,
-        List<Work> work
+        List<Work> work,
+        Map<Work, Outcome> outcomes
     ) {
-        ConfirmedAlightingAwareEvaluation confirmed = new ConfirmedAlightingAwareEvaluation(
-            jdbc, route, date, through, confirmedObservationLimit);
+        ConfirmedAlightingAwareEvaluation confirmed = new ConfirmedAlightingAwareEvaluation(history, date, through);
         for (Work item : work) {
-            settleConfirmed(item, revision, now, confirmed);
+            if (!item.eligible()) {
+                outcomes.put(item, Outcome.unsupported("SOURCE_QUALITY_EXCLUDED"));
+                continue;
+            }
+            outcomes.put(item, confirmed.evaluate(item.id(), item.stop(), JSON.readTree(item.snapshot())));
         }
     }
 
-    private void settleConfirmed(
-        Work work,
-        final long revision,
-        Instant now,
-        ConfirmedAlightingAwareEvaluation confirmed
+    private List<Work> readWork(
+        final long route,
+        final int limit,
+        Instant dueThrough,
+        final boolean lock
     ) {
-        if (!work.eligible()) {
-            finish(work, revision, now, Outcome.unsupported("SOURCE_QUALITY_EXCLUDED"));
-            return;
-        }
-        Outcome outcome = confirmed.evaluate(work.id(), work.stop(), JSON.readTree(work.snapshot()));
-        if (outcome == null) {
-            defer(work, revision, now, "NO_CLOSED_IDENTITY_SAFE_PASS");
-            return;
-        }
-        finish(work, revision, now, outcome);
-    }
-
-    private List<Work> readWork(final long route, final int limit, Instant dueThrough) {
-        return jdbc.sql("""
-            SELECT w.vehicle_observation_id,w.target_stop_order,w.target_kind,w.label_version,
-                   CASE WHEN w.label_version='alighting-confirmed-capacity-snapshot-v3' THEN coalesce(batch.input_confirmed_at,batch.response_received_at)
-                     ELSE batch.response_received_at END AS source_at,f.feature_snapshot::text,
-                   source.vehicle_id,source.vehicle_trip_key,source.quality_direction,
-                   (source.remaining_seats IS NOT NULL) AS forecast_eligible
-            FROM alighting_forecast_evaluation_work w
-            JOIN seat_forecast f USING(vehicle_observation_id,target_stop_order)
-            JOIN operational_observation source ON source.id=w.vehicle_observation_id
-            JOIN observation_batch batch ON batch.id=source.observation_batch_id
-            WHERE w.route_version_id=:route AND w.next_attempt_at<=:dueThrough
-            ORDER BY w.next_attempt_at,w.vehicle_observation_id,w.target_stop_order,w.target_kind
-            LIMIT :limit FOR UPDATE OF w SKIP LOCKED
-            """).param("route", route).param("limit", limit).param("dueThrough", dueThrough.atOffset(ZoneOffset.UTC))
+        // Work references both the forecast and the observation, and each observation has a batch.
+        // Select and lock the due keys before joining those required inputs.
+        // Keep the route as the leading sort key so a generic plan can use the route-local due index.
+        String sql = """
+            WITH work_page AS MATERIALIZED (
+                SELECT w.vehicle_observation_id, w.target_stop_order, w.target_kind, w.label_version, w.next_attempt_at
+                FROM alighting_forecast_evaluation_work w
+                WHERE w.route_version_id BETWEEN :route AND :route AND w.next_attempt_at <= :dueThrough
+                ORDER BY w.route_version_id, w.next_attempt_at, w.vehicle_observation_id,
+                         w.target_stop_order, w.target_kind, w.label_version
+                LIMIT :limit
+                %s
+            ), source_details AS MATERIALIZED (
+                SELECT source.*
+                FROM (SELECT DISTINCT vehicle_observation_id FROM work_page) ids
+                CROSS JOIN LATERAL (
+                    SELECT o.id, o.observation_batch_id, o.vehicle_id, o.vehicle_trip_key, o.quality_direction,
+                           (o.remaining_seats IS NOT NULL) AS forecast_eligible
+                    FROM operational_observation o
+                    WHERE o.id = ids.vehicle_observation_id
+                    OFFSET 0
+                ) source
+            ), batch_details AS (
+                SELECT batch.*
+                FROM (SELECT DISTINCT observation_batch_id FROM source_details) ids
+                CROSS JOIN LATERAL (
+                    SELECT b.id, b.input_confirmed_at, b.response_received_at
+                    FROM observation_batch b
+                    WHERE b.id = ids.observation_batch_id
+                    OFFSET 0
+                ) batch
+            )
+            SELECT w.vehicle_observation_id, w.target_stop_order, w.target_kind, w.label_version, w.next_attempt_at,
+                   CASE WHEN w.label_version = 'alighting-confirmed-capacity-snapshot-v3'
+                       THEN coalesce(batch.input_confirmed_at, batch.response_received_at)
+                       ELSE batch.response_received_at END AS source_at, f.feature_snapshot::text,
+                   source.vehicle_id, source.vehicle_trip_key, source.quality_direction, source.forecast_eligible
+            FROM work_page w
+            JOIN source_details source ON source.id = w.vehicle_observation_id
+            JOIN batch_details batch ON batch.id = source.observation_batch_id
+            CROSS JOIN LATERAL (
+                SELECT forecast.feature_snapshot
+                FROM seat_forecast forecast
+                WHERE forecast.vehicle_observation_id = w.vehicle_observation_id
+                  AND forecast.target_stop_order = w.target_stop_order
+                OFFSET 0
+            ) f
+            ORDER BY w.next_attempt_at, w.vehicle_observation_id, w.target_stop_order, w.target_kind, w.label_version
+            """.formatted(lock ? "FOR UPDATE OF w SKIP LOCKED" : "");
+        return jdbc.sql(sql)
+            .param("route", route)
+            .param("limit", limit)
+            .param("dueThrough", dueThrough.atOffset(ZoneOffset.UTC))
             .query((rs, n) -> new Work(rs.getLong("vehicle_observation_id"), rs.getInt("target_stop_order"),
                 rs.getString("target_kind"), rs.getString("label_version"), route,
                 rs.getObject("source_at", OffsetDateTime.class).toInstant(), rs.getString("feature_snapshot"),
                 rs.getString("vehicle_id"), rs.getString("vehicle_trip_key"), rs.getLong("quality_direction"),
-                rs.getBoolean("forecast_eligible")))
+                rs.getBoolean("forecast_eligible"), rs.getObject("next_attempt_at", OffsetDateTime.class).toInstant()))
             .list();
     }
 
-    private void settleWork(
+    private Outcome evaluateWork(
         Work work,
-        final long revision,
-        Instant now,
         List<Evidence> evidence,
         Map<Long, Evidence> byId,
         Map<List<Integer>, List<AlightingAwarePassEvent>> eventCache,
@@ -281,27 +462,18 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         String sourceProblem
     ) {
         if (!canonical(work.version()).equals(VERSION)) {
-            finish(work, revision, now, Outcome.unsupported("MODEL_CONTRACT_RETIRED"));
-            return;
+            return Outcome.unsupported("MODEL_CONTRACT_RETIRED");
         }
         if (inputLimit) {
-            finish(work, revision, now, Outcome.unsupported("OBSERVATION_INPUT_LIMIT"));
-            return;
+            return Outcome.unsupported("OBSERVATION_INPUT_LIMIT");
         }
         if (sourceProblem != null) {
-            finish(work, revision, now, Outcome.unsupported(sourceProblem));
-            return;
+            return Outcome.unsupported(sourceProblem);
         }
         if (!work.eligible()) {
-            finish(work, revision, now, Outcome.unsupported("SOURCE_QUALITY_EXCLUDED"));
-            return;
+            return Outcome.unsupported("SOURCE_QUALITY_EXCLUDED");
         }
-        Outcome result = evaluate(work, evidence, byId, eventCache);
-        if (result == null) {
-            defer(work, revision, now, "NO_CLOSED_IDENTITY_SAFE_PASS");
-            return;
-        }
-        finish(work, revision, now, result);
+        return evaluate(work, evidence, byId, eventCache);
     }
 
     private List<Evidence> readObservations(final long route, LocalDate date, Instant now) {
@@ -579,7 +751,13 @@ public class JdbcAlightingAwareForecastEvaluation implements AlightingAwareForec
         String vehicle,
         String trip,
         long direction,
-        boolean eligible
+        boolean eligible,
+        Instant nextAttemptAt
+    ) {
+    }
+
+    private record PreparedPage(
+        long revision, Instant now, List<Work> work, Map<Work, Outcome> outcomes, boolean moreWork
     ) {
     }
 

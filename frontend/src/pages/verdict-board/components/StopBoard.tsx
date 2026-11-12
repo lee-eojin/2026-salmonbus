@@ -5,6 +5,7 @@ import type { LiveVehicleMotionStore } from "../hooks/useLiveVehicleMotion";
 import type { StopSelection } from "./stopSelection";
 import { LOADING_NOTICE, LOAD_FAILED_NOTICE, OUT_OF_SERVICE_NOTICE } from "./verdictCopy";
 import { StopList } from "./StopList";
+import type { ActionGuidanceView } from "./actionGuidance";
 import type { StationArrivalDetails } from "./stationArrivalPolicy";
 import * as styles from "./StopBoard.css";
 import type { FavoriteBoardRoute } from "./FavoriteButton";
@@ -15,7 +16,7 @@ type NoticeStatus = "loading" | "error" | "outOfService";
 
 type StopBoardProps =
   | { status: "loading" | "outOfService"; onRetry?: never; retrying?: never; autoRetry?: never }
-  | { status: "error"; onRetry?: () => void; retrying?: boolean; autoRetry?: boolean }
+  | { status: "error"; onRetry?: () => void; retrying?: boolean; autoRetry?: boolean; inSheet?: boolean }
   | {
       status: "ready";
       favoriteRoute?: FavoriteBoardRoute;
@@ -27,6 +28,7 @@ type StopBoardProps =
       scrollRequest: StopSelection | null;
       selectedVehicleKey: string | null;
       stationArrivals: StationArrivalDetails | null;
+      actionGuidance?: ActionGuidanceView;
       onToggle: (sequence: number) => void;
       onVehicleSelect: (key: string) => void;
       onVehicleDeselect: () => void;
@@ -61,6 +63,7 @@ export function StopBoard(props: StopBoardProps) {
           scrollRequest={props.scrollRequest}
           selectedVehicleKey={props.selectedVehicleKey}
           stationArrivals={props.stationArrivals}
+          {...(props.actionGuidance ? { actionGuidance: props.actionGuidance } : {})}
           onToggle={props.onToggle}
           onVehicleSelect={props.onVehicleSelect}
           scrollContainerRef={scrollContainerRef}
@@ -72,7 +75,11 @@ export function StopBoard(props: StopBoardProps) {
   }
 
   return (
-    <section className={styles.noticeBoard} role="region" aria-label="판정보드 정류장 목록">
+    <section
+      className={props.status === "error" && props.inSheet ? styles.sheetNoticeBoard : styles.noticeBoard}
+      role="region"
+      aria-label="판정보드 정류장 목록"
+    >
       {props.status === "error" && (
         <img className={styles.mascot} src={salmongCrying} alt="연어 버스 로고" width={96} height={96} />
       )}

@@ -12,14 +12,12 @@ import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwareObse
 import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwarePassEvent;
 import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwareRouteStatistics;
 import com.gustler.backend.forecasting.domain.model.alighting.AlightingAwareVehiclePrefix;
-import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -41,8 +39,7 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         WITH batches AS (
           SELECT id,response_received_at,row_number() OVER (ORDER BY response_received_at,id)-1 AS rank
           FROM observation_batch WHERE route_version_id IN (:versions) AND response_received_at IS NOT NULL
-            AND (response_received_at,id)<=(:until,:batch)
-            AND (:seedBatch=0 OR (response_received_at,id)>(:seedTime,:seedBatch))
+            %s
         ), observations AS (
           SELECT DISTINCT ON (o.vehicle_id,b.id) o.id,b.id AS batch_id,b.rank,b.response_received_at,
             o.vehicle_id,o.passed_stop_order,o.stop_order,o.running_state,o.remaining_seats,o.crowd_level
@@ -55,11 +52,8 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
           SELECT id,route_version_id,input_confirmed_at AS available_at,response_received_at AS physical_at,
             row_number() OVER (ORDER BY input_confirmed_at,id)-1 AS rank
           FROM observation_batch WHERE route_version_id IN (:versions)
-            AND ingestion_origin='LIVE' AND outcome='SUCCESS_ROWS' AND stored_rows>0
-            AND input_confirmed_at>=response_received_at
-            AND input_confirmed_at<=response_received_at+interval '90 seconds'
-            AND (input_confirmed_at,id)<=(:until,:batch)
-            AND (:seedBatch=0 OR (input_confirmed_at,id)>(:seedTime,:seedBatch))
+            AND %s
+            %s
         ), observations AS (
           SELECT o.id,b.id AS batch_id,b.rank,b.available_at AS response_received_at,b.physical_at,
             b.route_version_id,o.vehicle_id,o.passed_stop_order,o.stop_order,o.running_state,o.crowd_level,
@@ -76,19 +70,31 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
           SELECT batch.id FROM observation_batch batch LEFT JOIN vehicle_observation observation
             ON observation.observation_batch_id=batch.id
           WHERE batch.route_version_id IN (:versions) AND batch.response_received_at IS NOT NULL
-            AND (batch.response_received_at,batch.id)<=(:until,:batch)
-            AND (:seedBatch=0 OR (batch.response_received_at,batch.id)>(:seedTime,:seedBatch))
+            %s
           GROUP BY batch.id,batch.stored_rows,batch.outcome
           HAVING count(observation.id)<>coalesce(batch.stored_rows,0)
             OR (batch.outcome IN ('SUCCESS_ROWS','SUCCESS_EMPTY') AND batch.stored_rows IS NULL)
         )
         """;
+    private static final String COUNT_BATCHES = """
+        SELECT count(*) FROM observation_batch
+        WHERE route_version_id IN (:versions) AND response_received_at IS NOT NULL
+          %s
+        """;
     private static final String READ_VERSIONS = """
-        SELECT DISTINCT version.id FROM route_version version JOIN route route ON route.id=version.route_id
-        JOIN observation_batch batch ON batch.route_version_id=version.id
-        WHERE route.display_name=:name AND (batch.response_received_at,batch.id)<=(:until,:batch)
+        SELECT version.id FROM route_version version JOIN route route ON route.id=version.route_id
+        WHERE route.display_name=:name AND EXISTS (%s)
         ORDER BY version.id
         """;
+    private static final String VERSION_HAS_HISTORY = """
+        SELECT 1 FROM observation_batch batch
+        WHERE batch.route_version_id=version.id AND (batch.response_received_at,batch.id)<=(:until,:batch)
+        """;
+    private static final String CONFIRMED_INPUT = """
+        ingestion_origin='LIVE' AND outcome='SUCCESS_ROWS' AND stored_rows>0
+        AND input_confirmed_at>=response_received_at
+        AND input_confirmed_at<=response_received_at+%s
+        """.formatted(ConfirmedAlightingAwareInput.MAX_CONFIRMATION_DELAY).strip();
 
     private final JdbcClient jdbc;
     private final VehicleCapacityCache capacities;
@@ -112,11 +118,7 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         this.rushOnly = rushOnly;
         this.origins = new HashMap<>();
         this.seeds = new AlightingAwareHistorySeedReader(seedDirectory, maximumRows);
-        String confirmedDirectory = "";
-        if (!seedDirectory.isBlank()) {
-            confirmedDirectory = Path.of(seedDirectory).resolve(AlightingAwareRouteStatistics.CONFIRMED_PROFILE).toString();
-        }
-        this.confirmedSeeds = new AlightingAwareHistorySeedReader(confirmedDirectory, maximumRows);
+        this.confirmedSeeds = AlightingAwareHistorySeedReader.confirmed(seedDirectory, maximumRows);
         if (maximumRows < 1) {
             throw new IllegalArgumentException("AlightingAware history row limit must be positive");
         }
@@ -141,25 +143,33 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         final long batchId,
         RouteStops stops,
         AlightingAwareRouteStatistics statistics) {
-        return read(batchId, stops, statistics, false);
+        return read(batchId, stops, statistics, false, false);
     }
 
     Map<Long, AlightingAwareFeatureSnapshot> readForCheckpoint(
         final long batchId,
         RouteStops stops,
         AlightingAwareRouteStatistics statistics) {
-        return read(batchId, stops, statistics, true);
+        return read(batchId, stops, statistics, true, false);
+    }
+
+    @Override
+    public Map<Long, AlightingAwareFeatureSnapshot> readExtended(
+        final long batchId, RouteStops stops, AlightingAwareRouteStatistics statistics
+    ) {
+        return read(batchId, stops, statistics, false, true);
     }
 
     private Map<Long, AlightingAwareFeatureSnapshot> read(
         final long batchId,
         RouteStops stops,
         AlightingAwareRouteStatistics statistics,
-        final boolean checkpointOnly
+        final boolean checkpointOnly,
+        final boolean extendedHours
     ) {
         validateRoute(stops, statistics);
         Target target = target(batchId, statistics.confirmedProfile());
-        validateScope(stops, statistics, target, checkpointOnly);
+        validateScope(stops, statistics, target, checkpointOnly, extendedHours);
         List<Long> versions = compatibleVersions(statistics, target.time(), batchId);
         AlightingAwareHistorySeedReader reader = seedReader(statistics);
         AlightingAwareHistorySeedReader.Seed seed = reader.read(stops.routeVersionId());
@@ -171,8 +181,12 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         Map<String, AlightingAwareVehiclePrefix> prefix = cursor.prefix();
         List<AlightingAwarePassEvent> events = AlightingAwareHistoryCompactor.resolve(
             new AlightingAwareHistoryCompactor.History(prefix, history, cursor.pastEvents()), statistics.realStopOrders());
-        Map<Long, AlightingAwareFeatureSnapshot> snapshots = snapshots(stops, statistics, cursor, history, events);
+        Map<Long, AlightingAwareFeatureSnapshot> snapshots = checkpointOnly
+            ? Map.of() : snapshots(stops, statistics, cursor, history, events);
         saveCheckpoint(stops.routeVersionId(), cursor, history, events, reader);
+        if (!checkpointOnly && cursor.target().confirmed() && reader.configured() && !cursor.isOlderThanSeed()) {
+            protectCheckpoint(stops.routeVersionId(), cursor);
+        }
         return Map.copyOf(snapshots);
     }
 
@@ -190,26 +204,15 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         RouteStops stops,
         AlightingAwareRouteStatistics statistics,
         Target target,
-        final boolean checkpointOnly
+        final boolean checkpointOnly,
+        final boolean extendedHours
     ) {
         if (!checkpointOnly && target.version() != stops.routeVersionId()) {
             throw new AlightingAwareFeatureUnavailableException("ALIGHTING_AWARE_ROUTE_VERSION_MISMATCH");
         }
-        if (rushOnly && !isSupportedRush(statistics, target.time())) {
+        if (rushOnly && !extendedHours && !statistics.timeCell(target.time().atZone(ZoneId.of("Asia/Seoul"))).isRush()) {
             throw new AlightingAwareFeatureUnavailableException("ALIGHTING_AWARE_OUTSIDE_VALIDATED_RUSH_SCOPE");
         }
-    }
-
-    private static boolean isSupportedRush(AlightingAwareRouteStatistics statistics, Instant at) {
-        ZonedDateTime local = at.atZone(ZoneId.of("Asia/Seoul"));
-        if (!statistics.dayType(local.toLocalDate()).equals("work")) {
-            return false;
-        }
-        final int minute = local.getHour() * 60 + local.getMinute();
-        if (minute >= 360 && minute < 600) {
-            return true;
-        }
-        return minute >= 1020 && minute < 1260;
     }
 
     private void validateHistoryOrigin(RouteStops stops, ReplayCursor cursor) {
@@ -264,10 +267,10 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
             history.addAll(cursor.seed().observations().stream().filter(cursor::includes).toList());
         }
         final long rankOffset = cursor.lastRank() + 1;
-        String sql = READ_HISTORY;
-        if (statistics.confirmedProfile()) {
-            sql = READ_CONFIRMED_HISTORY;
-        }
+        String window = cursor.window("");
+        String sql = statistics.confirmedProfile()
+            ? READ_CONFIRMED_HISTORY.formatted(CONFIRMED_INPUT, window)
+            : READ_HISTORY.formatted(window);
         final int turn = statistics.turn();
         history.addAll(cursor.bind(jdbc.sql(sql)).param("limit", maximumRows + 1)
             .query((row, index) -> observation(row, rankOffset, statistics.confirmedProfile(), turn)).list());
@@ -303,8 +306,8 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
     }
 
     private void validateRowsAndAnchor(ReplayCursor cursor) {
-        final boolean incomplete = cursor.bind(jdbc.sql(profileSql(CHECK_ROWS, cursor.target().confirmed())))
-            .query(Boolean.class).single();
+        String sql = profileSql(CHECK_ROWS, cursor.target().confirmed()).formatted(cursor.window("batch."));
+        final boolean incomplete = cursor.bind(jdbc.sql(sql)).query(Boolean.class).single();
         if (incomplete) {
             throw new AlightingAwareFeatureUnavailableException("ALIGHTING_AWARE_SOURCE_ROWS_MISSING");
         }
@@ -377,14 +380,11 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         if (!confirmed) {
             return sql;
         }
-        String predicate = "ingestion_origin='LIVE' AND outcome='SUCCESS_ROWS' AND stored_rows>0 "
-            + "AND input_confirmed_at>=response_received_at "
-            + "AND input_confirmed_at<=response_received_at+interval '90 seconds'";
         String alias = "";
         if (sql.contains("batch.response_received_at")) {
             alias = "batch.";
         }
-        String qualified = predicate.replace("ingestion_origin", alias + "ingestion_origin")
+        String qualified = CONFIRMED_INPUT.replace("ingestion_origin", alias + "ingestion_origin")
             .replace("outcome", alias + "outcome").replace("stored_rows", alias + "stored_rows")
             .replace("input_confirmed_at", alias + "input_confirmed_at")
             .replace("response_received_at", alias + "response_received_at");
@@ -413,17 +413,32 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
         List<AlightingAwarePassEvent> events,
         AlightingAwareHistorySeedReader reader
     ) {
-        final long newBatches = cursor.bind(jdbc.sql(
-            profileSql("SELECT count(*) FROM observation_batch WHERE route_version_id IN (:versions) AND response_received_at IS NOT NULL AND (response_received_at,id)<=(:until,:batch) AND (:seedBatch=0 OR (response_received_at,id)>(:seedTime,:seedBatch))", cursor.target().confirmed())))
-            .query(Long.class).single();
+        String sql = profileSql(COUNT_BATCHES, cursor.target().confirmed()).formatted(cursor.window(""));
+        final long newBatches = cursor.bind(jdbc.sql(sql)).query(Long.class).single();
         if (!cursor.isOlderThanSeed()) {
             reader.write(routeVersionId, new AlightingAwareHistorySeedReader.Seed(history, cursor.batchId(),
                 cursor.lastRank() + newBatches, cursor.target().time(), cursor.prefix(), events));
         }
     }
 
+    private void protectCheckpoint(final long routeVersionId, ReplayCursor cursor) {
+        // 뒤에 확정된 배치도 체크포인트보다 최대 90초 먼저 수신됐을 수 있다.
+        jdbc.sql("""
+            INSERT INTO alighting_history_checkpoint(route_version_id,through_at,through_batch_id,retain_from)
+            VALUES(:version,:through,:batch,:through-%s)
+            ON CONFLICT(route_version_id) DO UPDATE
+            SET through_at=EXCLUDED.through_at, through_batch_id=EXCLUDED.through_batch_id,
+                retain_from=EXCLUDED.retain_from
+            WHERE (alighting_history_checkpoint.through_at,alighting_history_checkpoint.through_batch_id)
+                < (EXCLUDED.through_at,EXCLUDED.through_batch_id)
+            """.formatted(ConfirmedAlightingAwareInput.MAX_CONFIRMATION_DELAY))
+            .param("version", routeVersionId).param("through", cursor.target().time().atOffset(ZoneOffset.UTC))
+            .param("batch", cursor.batchId()).update();
+    }
+
     private List<Long> compatibleVersions(AlightingAwareRouteStatistics statistics, Instant until, final long batchId) {
-        List<Long> versions = jdbc.sql(profileSql(READ_VERSIONS, statistics.confirmedProfile())).param("name", statistics.route())
+        String history = profileSql(VERSION_HAS_HISTORY, statistics.confirmedProfile());
+        List<Long> versions = jdbc.sql(READ_VERSIONS.formatted(history)).param("name", statistics.route())
             .param("until", until.atOffset(ZoneOffset.UTC)).param("batch", batchId).query(Long.class).list();
         if (versions.isEmpty()) {
             throw new AlightingAwareFeatureUnavailableException("ALIGHTING_AWARE_ROUTE_HISTORY_MISSING");
@@ -546,10 +561,31 @@ public class JdbcAlightingAwareFeatureQuery implements AlightingAwareFeatureQuer
             return event.confirmedAt().equals(target.time()) && event.confirmation().batchId() <= batchId;
         }
 
+        private String window(String prefix) {
+            String received = prefix + "response_received_at";
+            String orderedAt = target.confirmed() ? prefix + "input_confirmed_at" : received;
+            String order = "(" + orderedAt + "," + prefix + "id)";
+            String window = "AND " + order + "<=(:until,:batch)";
+            if (target.confirmed()) {
+                // 확정 시각은 수신 시각부터 최대 허용 시간 이내다. 수신 시각 인덱스로 후보를 좁힌다.
+                window += " AND " + received + "<=:until";
+                if (seedBatchId() != 0) {
+                    window += " AND " + received + ">=:seedTime-" + ConfirmedAlightingAwareInput.MAX_CONFIRMATION_DELAY;
+                }
+            }
+            if (seedBatchId() != 0) {
+                window += " AND " + order + ">(:seedTime,:seedBatch)";
+            }
+            return window;
+        }
+
         private JdbcClient.StatementSpec bind(JdbcClient.StatementSpec query) {
-            return query.param("versions", versions).param("until", target.time().atOffset(ZoneOffset.UTC))
-                .param("batch", batchId).param("seedBatch", seedBatchId())
-                .param("seedTime", seedTime().atOffset(ZoneOffset.UTC));
+            query.param("versions", versions).param("until", target.time().atOffset(ZoneOffset.UTC))
+                .param("batch", batchId);
+            if (seedBatchId() != 0) {
+                query.param("seedBatch", seedBatchId()).param("seedTime", seedTime().atOffset(ZoneOffset.UTC));
+            }
+            return query;
         }
     }
 }
