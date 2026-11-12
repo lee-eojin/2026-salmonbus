@@ -1,4 +1,6 @@
-<h1 align="center"><a href="https://www.salmonbus.com">연어버스 사용하러가기</a></h1>
+<h1 align="center"><a href="https://www.salmonbus.com">연어버스 사용하러 가기</a></h1>
+
+<p align="center"><a href="https://www.salmonbus.com"><img src="docs/readme-play/banner.png" width="830" alt="빨간 버스를 안고 웃는 쌀뭉이. 누르면 연어버스로 갑니다"></a></p>
 
 ### [연어버스를 소개합니다!](https://salmonbus-landing.vercel.app/__preview/landing)
 
