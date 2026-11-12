@@ -6,6 +6,8 @@
 
 연어버스는 경기도 광역버스가 내 정류장에 도착할 때 자리가 몇 석 남을지 미리 알려 주는 서비스입니다.
 
+<br>
+
 ## 오늘은 늦지 않게 출근할 수 있을까?
 
 아침 8시입니다. 아래에서 생각을 하나 골라 눌러 보세요. 고른 길이 그 아래에 펼쳐집니다.
@@ -623,7 +625,7 @@
 | [`frontend`](frontend) | 웹 화면입니다. |
 | [`app`](app) | iOS 앱입니다. WebView에서 웹 화면을 실행합니다. |
 | [`backend`](backend) | API 서버(`api-app`)와 worker(`worker-app`)입니다. worker는 GBIS에서 버스 위치와 좌석을 수집하고 예보를 만듭니다. |
-| [`contract`](contract) | 프런트엔드와 백엔드가 함께 보는 API 명세(OpenAPI)입니다. |
+| [`contract`](contract) | Frontend와 Backend가 함께 보는 API 명세(OpenAPI)입니다. |
 | [`dev`](dev) | 로컬 실행 환경(Docker Compose)입니다. |
 | [`docs`](docs) | 설계와 검증 기록입니다. |
 
@@ -635,7 +637,7 @@ Docker Desktop이 있는 Apple Silicon 맥에서 저장소 루트의 명령 하�
 ./dev/local.sh up --watch
 ```
 
-화면은 `http://localhost:3000`, API는 `http://localhost:8080`입니다. 필요한 버전과 나머지 명령은 [로컬 실행 안내](dev/README.md)에 있습니다.
+필요한 버전과 나머지 명령은 [로컬 실행 안내](dev/README.md)에 있습니다.
 
 ## 팀
 
