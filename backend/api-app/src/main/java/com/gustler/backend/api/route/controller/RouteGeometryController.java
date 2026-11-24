@@ -6,6 +6,7 @@ import com.gustler.backend.api.docs.RouteGeometryApiDocsExamples;
 import com.gustler.backend.api.error.ErrorResponse;
 import com.gustler.backend.api.route.RouteId;
 import com.gustler.backend.api.route.application.RouteGeometryQueryService;
+import com.gustler.backend.api.route.controller.RouteGeometryResponseCache.CachedRouteGeometry;
 import com.gustler.backend.api.route.dto.RouteGeometryResponse;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -18,6 +19,7 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import java.time.Duration;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -35,9 +37,16 @@ import org.springframework.web.context.request.WebRequest;
 public class RouteGeometryController {
     private static final CacheControl CACHE = CacheControl.maxAge(Duration.ofMinutes(5)).cachePublic().mustRevalidate();
     private final RouteGeometryQueryService service;
+    private final RouteGeometryResponseCache cache;
 
     public RouteGeometryController(RouteGeometryQueryService service) {
+        this(service, RouteGeometryResponseCache.disabled());
+    }
+
+    @Autowired
+    public RouteGeometryController(RouteGeometryQueryService service, RouteGeometryResponseCache cache) {
         this.service = service;
+        this.cache = cache;
     }
 
     /**
@@ -63,8 +72,8 @@ public class RouteGeometryController {
             READY는 도로 형상과 모든 정류장 좌표 제공, PARTIAL은 도로 형상을 유지하되 일부 정류장의 `point=null`인 상태입니다.
             자동 형상의 최초 개선 시도가 아직 끝나지 않았으면 원본 검증이 먼저 끝났어도 UNAVAILABLE/GENERATION_PENDING입니다. 첫 시도 후 일시 오류로 재시도 중이거나 개선 결과를 사용할 수 없을 때는 유효한 현재 원본 대체를 제공합니다. 사용할 결과가 없고 생성 또는 자료 복구가 진행 가능하면 GENERATION_PENDING, 모두 종료됐거나 입력·선택 묶음이 무효이면 DISPLAY_WITHHELD입니다. 기본 응답의 두 UNAVAILABLE 상태는 `points=[]`, `paths=null`, 연결점 생략이며 원본 정류장 GPS는 유지합니다.
             UNAVAILABLE/NOT_COLLECTED는 현재 판본의 형상 미수집으로 `points=[]`, `paths=null`이며, 정류장 좌표가 있으면 마커만 표시할 수 있습니다.
-            dev 공급 자료는 현재 41노선의 정류장 방문 3,215건과 형상점 35,542개를 포함한 GBIS 정적 재생 자료입니다.
-            8노선은 기존 정적 API 저장본, 33노선은 공식 공개 지도 형상입니다. 방문 건수는 고유 물리 정류장 수가 아닙니다.
+            dev 공급 자료는 현재 45노선의 정류장 방문 3,445건과 형상점 38,295개를 포함한 GBIS 정적 재생 자료입니다.
+            8노선은 기존 정적 API 저장본, 37노선은 공식 공개 지도 형상입니다. 방문 건수는 고유 물리 정류장 수가 아닙니다.
             초기 수집 완료 전이나 새 카탈로그 판본으로 바뀐 직후에는 미수집 상태일 수 있으며, dev 자료가 실시간 최신성을 보장하지는 않습니다.
 
             `referenceVersionId`를 생략하면 현재 판본을 반환합니다. 지정한 판본이 현재와 다르면 409이며 판본 없이 다시 조회합니다.
@@ -153,15 +162,23 @@ public class RouteGeometryController {
         @RequestParam(defaultValue = "false") boolean includeDiagnostics,
         WebRequest request
     ) {
-        RouteGeometryResponse response =
-            RouteGeometryResponse.from(service.get(new RouteId(routeId), referenceVersionId), includeDiagnostics);
-        if (response.status().equals("UNAVAILABLE")) {
-            return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(response);
+        RouteId id = new RouteId(routeId);
+        if (includeDiagnostics || !cache.enabled()) {
+            return respond(CachedRouteGeometry.of(
+                RouteGeometryResponse.from(service.get(id, referenceVersionId), includeDiagnostics)), request);
         }
-        String etag = "W/\"g-" + response.geometryRevision() + "\"";
-        if (request.checkNotModified(etag)) {
-            return ResponseEntity.status(HttpStatus.NOT_MODIFIED).cacheControl(CACHE).eTag(etag).build();
+        try (RouteGeometryResponseCache.Lookup lookup = cache.lookup()) {
+            return respond(service.respond(id, referenceVersionId, lookup), request);
         }
-        return ResponseEntity.ok().cacheControl(CACHE).eTag(etag).body(response);
+    }
+
+    private static ResponseEntity<RouteGeometryResponse> respond(CachedRouteGeometry response, WebRequest request) {
+        if (response.etag() == null) {
+            return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(response.body());
+        }
+        if (request.checkNotModified(response.etag())) {
+            return ResponseEntity.status(HttpStatus.NOT_MODIFIED).cacheControl(CACHE).eTag(response.etag()).build();
+        }
+        return ResponseEntity.ok().cacheControl(CACHE).eTag(response.etag()).body(response.body());
     }
 }

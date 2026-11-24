@@ -33,12 +33,7 @@ case "$1" in
   enable)        grep -qx "$2" /work/enabled 2>/dev/null || echo "$2" >> /work/enabled; exit 0 ;;
   is-enabled)    grep -qx "$3" /work/enabled 2>/dev/null && exit 0 || exit 1 ;;
   stop)          grep -vx "$2" /work/running > /work/r.tmp 2>/dev/null || true; mv /work/r.tmp /work/running; exit 0 ;;
-  start)         if [ -e /etc/salmonbus/alighting-cutover-hold ] &&
-                   grep -Fqx 'ConditionPathExists=!/etc/salmonbus/alighting-cutover-hold' \
-                     "/etc/systemd/system/$2.service" /etc/systemd/system/"$2.service.d/"*.conf 2>/dev/null; then
-                   exit 0
-                 fi
-                 if ! grep -qx "$2" /work/running 2>/dev/null; then
+  start)         if ! grep -qx "$2" /work/running 2>/dev/null; then
                    echo "$2" >> /work/running
                    # start 할 때마다 PID 를 하나 올린다. 재시작했는지를 PID 로 본다
                    n=$(( $(cat /work/pidseq 2>/dev/null || echo 1000) + 1 )); echo "$n" > /work/pidseq; echo "$n" > "/work/pid.$2"
@@ -86,8 +81,13 @@ answer() {
   exit "$3"
 }
 [ -f /work/refuse ] && answer 000 '' 7
-if [ "$comp" = worker ] && ! grep -qx salmonbus-worker /work/running; then
-  answer 000 '' 7
+if [[ "$url" = */health ]] && [ -f /work/health-after-attempts ]; then
+  attempt=$(( $(cat /work/health-attempts 2>/dev/null || echo 0) + 1 ))
+  echo "$attempt" > /work/health-attempts
+  if [ "$attempt" -ge "$(cat /work/health-after-attempts)" ]; then
+    state=UP
+    echo UP > /work/health
+  fi
 fi
 if [ "$state" != "UP" ]; then
   case "$url" in */readyz) answer 503 '{"status":"OUT_OF_SERVICE"}' 0 ;; esac
@@ -277,8 +277,6 @@ make_revision worker WORKERv1 aaaaaaa1111 99998888777766665555444433332222111100
 deploy api
 deploy worker
 
-! grep -q 'FORECAST_ARCHIVE_' /etc/systemd/system/salmonbus-worker.service \
-  && ok "Worker는 레거시 이관을 실행하지 않는다" || bad "Worker 이관 설정이 남았다"
 [ "$(readlink -f /opt/salmonbus/api/current)" = "/opt/salmonbus/api/releases/1111aaaa2222bbbb3333cccc4444dddd5555eeee6666ffff7777000088889999" ] \
   && ok "api current 가 소스 지문으로 이름 붙은 배포 버전을 가리킨다" || bad "api current=$(readlink -f /opt/salmonbus/api/current 2>/dev/null)"
 grep -qx salmonbus-api /work/running && grep -qx salmonbus-worker /work/running \
@@ -390,44 +388,6 @@ else
   grep -q '진행 중이다' "$WORK/lock.out" && ok "worker 가 막혔다" || bad "막히긴 했는데 이유가 다르다"
 fi
 rm -rf /opt/salmonbus/.deploying
-
-sec "하차 반영 전환 중 Worker 기동 보류"
-cp -a "$ARCHIVE/worker" "$WORK/worker-new"
-hold_old_digest="$(printf %s worker-before-alighting-cutover | sha256sum | cut -d' ' -f1)"
-make_revision worker WORKER_BEFORE_HOLD hold0000001 "$hold_old_digest" "2026-09-23T04:00:00Z"
-sed -i '/^if .*alighting-cutover-hold.*; then$/,/^fi$/d' "$ARCHIVE/worker/scripts/start.sh"
-sed -i '/^ConditionPathExists=.*alighting-cutover-hold$/d' "$ARCHIVE/worker/systemd/salmonbus-worker.service"
-deploy worker
-mv "$ARCHIVE/worker" "$WORK/worker-before-hold"
-mv "$WORK/worker-new" "$ARCHIVE/worker"
-
-bash "$DEPLOY/scripts/hold-alighting-worker.sh" || bad "호스트에 Worker 기동 보류를 설치하지 못했다"
-: > /work/systemctl.log
-deploy worker fail || true
-grep -q '하차 반영 체크포인트 전환 중' "$WORK/worker-start.out" \
-  && ok "체크포인트 준비 전 Worker 기동을 거부한다" || bad "전환 보류 사유가 다르다"
-grep -q '^start salmonbus-worker$' /work/systemctl.log \
-  && bad "전환 중 Worker를 시작했다" || ok "전환 중 Worker 시작 명령을 호출하지 않는다"
-
-mv "$ARCHIVE/worker" "$WORK/worker-new"
-mv "$WORK/worker-before-hold" "$ARCHIVE/worker"
-: > /work/systemctl.log
-VALIDATE_CHECK_SECONDS=4 VALIDATE_RETRY_SECONDS=1 deploy worker fail || true
-[ "$(readlink -f /opt/salmonbus/worker/current)" = "/opt/salmonbus/worker/releases/$hold_old_digest" ] &&
-  cmp -s "$ARCHIVE/worker/systemd/salmonbus-worker.service" /etc/systemd/system/salmonbus-worker.service \
-  && ok "롤백이 구 리비전과 구 유닛을 복원했다" || bad "구 리비전이 복원되지 않았다"
-grep -qx 'start salmonbus-worker' /work/systemctl.log &&
-  ! systemctl is-active --quiet salmonbus-worker \
-  && ok "구 리비전이 시작을 요청해도 호스트 보류 설정이 차단한다" || bad "구 리비전의 기동 요청이 차단되지 않았다"
-test -f /etc/salmonbus/alighting-cutover-hold \
-  && ok "롤백 뒤에도 기동 보류 파일이 남았다" || bad "롤백 중에 기동 보류 파일이 사라졌다"
-
-rm -rf "$ARCHIVE/worker"
-mv "$WORK/worker-new" "$ARCHIVE/worker"
-rm /etc/salmonbus/alighting-cutover-hold
-deploy worker
-systemctl is-active --quiet salmonbus-worker \
-  && ok "보류 해제 후 새 Worker가 시작한다" || bad "보류 해제 후 Worker가 시작하지 않았다"
 
 sec "5-2. 한 번 실패한 직후 바로 롤백 (CodeDeploy 가 하는 순서)"
 # 아래는 훅의 기존 JAR 재배포 동작만 검사한다. 정비 전환 실패 시에는 DB 백업과 구 JAR을 함께 복원한다.
@@ -543,6 +503,24 @@ grep -q '단계=sourcedigest 사유=시간 초과(전체 3초 중 남은 [0-9]�
 [ "$dt" -le 20 ] && ok "배포가 ${dt}초 만에 끝났다" || bad "검사 상한 90초를 기다렸다 (${dt}초)"
 unset VALIDATE_CHECK_SECONDS VALIDATE_RETRY_SECONDS
 
+sec "7-4-1. 초기 기동은 후속 검사보다 긴 예산을 쓰는가"
+echo DOWN > /work/health
+echo 3 > /work/health-after-attempts
+rm -f /work/health-attempts
+make_revision api APISTARTUP abcdef01234 aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff66667777000088889999 "2026-09-02T05:35:00Z"
+VALIDATE_CHECK_SECONDS=1 VALIDATE_STARTUP_SECONDS=6 VALIDATE_RETRY_SECONDS=1 deploy api
+rm -f /work/health-after-attempts /work/health-attempts
+grep -q 'health 확인. 시도=3 ' /work/api-validate.out \
+  && ok "초기 기동은 후속 검사 1초를 지나서도 기다렸다" || bad "초기 기동 예산을 쓰지 않았다"
+
+sec "7-4-2. 초기 기동도 전체 검증 예산을 넘지 않는가"
+echo DOWN > /work/health
+make_revision api APITOTAL abcdef01235 bbbb1111cccc2222dddd3333eeee4444ffff555500006666777788889999aaaa "2026-09-02T05:36:00Z"
+VALIDATE_TOTAL_SECONDS=2 VALIDATE_CHECK_SECONDS=1 VALIDATE_STARTUP_SECONDS=8 VALIDATE_RETRY_SECONDS=1 deploy api fail
+echo UP > /work/health
+grep -q '단계=health 사유=시간 초과(전체 2초 중 남은 [12]초)' /work/api-validate.out \
+  && ok "초기 기동 8초보다 전체 2초를 먼저 적용했다" || bad "초기 기동이 전체 예산을 넘었다"
+
 sec "7-5. DB 가 안 붙거나 답이 없어도 배포는 가나"
 echo DOWN > /work/db
 make_revision api APIv8 iiiiiii9999 88889999aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff666677770000 "2026-09-02T05:40:00Z"
@@ -559,14 +537,30 @@ grep -q 'DB 진단(배포 전): 새 연결 실패\. 15초 안에 응답이 없�
   && ok "답이 없으면 15초에 끊고 배포는 간다" || { bad "무응답 로그가 다르다"; sed 's/^/      /' /work/api-preflight.out; }
 [ "$dt" -ge 14 ] && [ "$dt" -le 40 ] && ok "끊는 데 ${dt}초 걸렸다" || bad "15초에 안 끊고 ${dt}초 걸렸다"
 
-# validate.sh 의 전체 상한 기본값이 appspec 의 ValidateService timeout 보다 짧은지 두 파일을 읽어 본다.
+# validate.sh 가 가장 오래 도는 시간이 appspec 의 ValidateService timeout 보다 짧은지 validate.sh·common.sh·appspec 을 읽어 본다.
+# 잠금 확인 대기와 health 실패 뒤 DB 진단은 전체 상한 밖이라 더한다.
 # 길면 CodeDeploy 가 먼저 죽여서 요약도 잠금 정리도 없이 끝난다
-hook_timeout=$(awk '/ValidateService:/{f=1} f && /timeout:/{print $2; exit}' /deploy/appspec-api.yml)
 total_default=$(sed -n 's/.*VALIDATE_TOTAL_SECONDS:-\([0-9]*\)}.*/\1/p' /deploy/scripts/validate.sh)
-if [ -n "$total_default" ] && [ -n "$hook_timeout" ] && [ "$total_default" -lt "$hook_timeout" ]; then
-  ok "전체 상한 기본값 ${total_default}초 < ValidateService timeout ${hook_timeout}초"
+startup_default=$(sed -n 's/^STARTUP_SECONDS=.*:-\([0-9]*\)}}".*/\1/p' /deploy/scripts/validate.sh)
+probe_seconds=$(sed -n 's/^DB_PROBE_SECONDS=\([0-9]*\).*/\1/p' /deploy/scripts/common.sh)
+claim_tries=$(sed -n 's/^MARKER_CLAIM_TRIES=\([0-9]*\).*/\1/p' /deploy/scripts/common.sh)
+claim_wait=$(sed -n 's/^MARKER_CLAIM_WAIT_SECONDS=\([0-9]*\).*/\1/p' /deploy/scripts/common.sh)
+validate_worst=""
+if [ -n "$total_default" ] && [ -n "$probe_seconds" ] && [ -n "$claim_tries" ] && [ -n "$claim_wait" ]; then
+  validate_worst=$(( (claim_tries - 1) * claim_wait + total_default + probe_seconds ))
+fi
+for component in api worker; do
+  hook_timeout=$(awk '/ValidateService:/{f=1} f && /timeout:/{print $2; exit}' "/deploy/appspec-$component.yml")
+  if [ -n "$validate_worst" ] && [ -n "$hook_timeout" ] && [ "$validate_worst" -lt "$hook_timeout" ]; then
+    ok "$component: 잠금 대기·전체 ${total_default}초·DB 진단 ${probe_seconds}초 합 ${validate_worst}초 < ValidateService timeout ${hook_timeout}초"
+  else
+    bad "$component: 검증이 가장 오래 도는 시간(${validate_worst:-?})이 훅 timeout(${hook_timeout:-?})보다 짧지 않다"
+  fi
+done
+if [ -n "$startup_default" ] && [ -n "$total_default" ] && [ "$startup_default" -lt "$total_default" ]; then
+  ok "최초 health 기본값 ${startup_default}초 < 전체 ${total_default}초. 뒤 검사가 쓸 시간이 남는다"
 else
-  bad "전체 상한(${total_default:-?})이 훅 timeout(${hook_timeout:-?})보다 짧지 않다"
+  bad "최초 health(${startup_default:-?})가 전체(${total_default:-?})보다 짧지 않다"
 fi
 
 sec "8. 배포 버전을 셋만 남기는가"

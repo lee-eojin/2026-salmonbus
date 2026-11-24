@@ -24,7 +24,15 @@ public final class AlightingAwareServingBundle {
     }
 
     public static ModelRelease load(Path directory) throws IOException {
-        AlightingAwareInferenceBundle bundle = AlightingAwareInferenceBundle.loadForServing(directory);
+        return load(directory, false);
+    }
+
+    /**
+     * @param allowSyntheticFixture {@link AlightingAwareInferenceBundle#loadForServing(Path, boolean)}와 같은 뜻이다
+     */
+    public static ModelRelease load(Path directory, final boolean allowSyntheticFixture) throws IOException {
+        AlightingAwareInferenceBundle bundle =
+            AlightingAwareInferenceBundle.loadForServing(directory, allowSyntheticFixture);
         JsonNode runtime = bundle.manifest().get("runtime");
         return ModelRelease.alighting(runtime.get("release_id").asString(), bundle.digest(),
             runtime.get("data_through").asString(), new SupportedForecastScope(bundle.routes()), readModel(bundle));
@@ -32,6 +40,10 @@ public final class AlightingAwareServingBundle {
 
     /** 해시 검증을 마친 모델을 읽는다. 배포 생성이나 활성화는 수행하지 않는다. */
     public static AlightingAwareSeatForecastModel readModel(AlightingAwareInferenceBundle bundle) {
+        return readModel(bundle, bundle.digest());
+    }
+
+    static AlightingAwareSeatForecastModel readModel(AlightingAwareInferenceBundle bundle, String digest) {
         Map<String, AlightingAwareRouteStatistics> statistics = new HashMap<>();
         Map<String, Map<Integer, String>> evidence = new HashMap<>();
         JsonNode extended = bundle.extendedHours();
@@ -51,14 +63,15 @@ public final class AlightingAwareServingBundle {
                     AlightingAwareInferenceBundle.model(extension.get("seats")), full));
                 settlement = extension.get("settlement");
             }
-            Map<Integer, String> targets = targetEvidence(route, bundle, stats, raw, settlement);
+            Map<Integer, String> targets = targetEvidence(route, digest, bundle, stats, raw, settlement);
             evidence.put(route, targets);
         }
-        return new AlightingAwareSeatForecastModel(bundle.predictor(), statistics, evidence, bundle.digest(), extendedPredictors);
+        return new AlightingAwareSeatForecastModel(bundle.predictor(), statistics, evidence, digest, extendedPredictors);
     }
 
     private static Map<Integer, String> targetEvidence(
         String route,
+        String digest,
         AlightingAwareInferenceBundle bundle,
         AlightingAwareRouteStatistics stats,
         JsonNode raw,
@@ -68,7 +81,7 @@ public final class AlightingAwareServingBundle {
         for (AlightingAwareRouteStatistics.Stop stop : stats.stops()) {
             ObjectNode snapshot = JSON.createObjectNode();
             snapshot.put("route", route);
-            snapshot.put("bundleDigest", bundle.digest());
+            snapshot.put("bundleDigest", digest);
             snapshot.put("capacityPolicy", stats.profile().capacity());
             snapshot.put("inputProfile", stats.profile().input());
             snapshot.put("turn", stats.turn());

@@ -6,11 +6,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.gustler.backend.api.board.support.BoardDatabaseFixture;
+import com.gustler.backend.api.board.support.BoardDatabaseFixture.RouteContext;
 import com.gustler.backend.support.IntegrationTest;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -244,6 +248,41 @@ class RouteApiContractTest {
             .andExpect(jsonPath("$.routes[0].id").value("204000057"));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"234001476", "222000209", "227000016", "234000079", "234000015"})
+    void 잠실_노선은_공개하고_예보_발행_여부로_준비_상태를_구분한다(String routeId) throws Exception {
+        OffsetDateTime now = OffsetDateTime.now();
+        BoardDatabaseFixture fixture = new BoardDatabaseFixture(jdbcClient);
+        RouteContext route = fixture.insertRoute(routeId, "잠실 노선", "기점", "종점", null,
+            "05:00", "23:00", null, null, now.minusDays(1));
+        fixture.insertStop(route, 1, "STOP-1", "기점", "UP", true);
+        fixture.insertStop(route, 2, "STOP-2", "종점", "UP", true);
+        final long model = fixture.insertModel("model-active", "ACTIVE", now.minusDays(1));
+        final long batch = fixture.insertBatch(route, now.minusSeconds(30), "SUCCESS_ROWS", 1);
+        final long observation = fixture.insertObservation(route, batch, 1, "V1", 1, "STOP-1", 1, 2, 8, null);
+
+        mockMvc.perform(get("/api/v1/routes"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.routes[0].id").value(routeId))
+            .andExpect(jsonPath("$.routes[0].status").value("PREPARING"));
+
+        fixture.insertRun(batch, model, "PUBLISHED", now);
+        fixture.insertForecast(observation, 2, model, 0.25, 6.5);
+
+        mockMvc.perform(get("/api/v1/routes"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.routes[0].status").value("FORECAST_READY"));
+        mockMvc.perform(get("/api/v1/routes/{routeId}/board", routeId))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.route.status").value("FORECAST_READY"));
+        mockMvc.perform(get("/api/v1/routes/{routeId}/watch", routeId))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.route.id").value(routeId))
+            .andExpect(jsonPath("$.stops[1].approachingVehicles[0].forecast.expectedSeats").value(6.5));
+        mockMvc.perform(get("/api/v1/routes/{routeId}/vehicles", routeId))
+            .andExpect(status().isOk());
+    }
+
     private long insertRoute(
         String sourceRouteId,
         String displayName,
@@ -380,19 +419,19 @@ class RouteApiContractTest {
             .query(Long.class)
             .single();
         jdbcClient.sql("""
-                INSERT INTO forecast_publication (
-                    source_batch_id, route_version_id,
-                    model_deployment_id, demand_statistics_revision, quality_revision,
-                    observed_at, generated_at, published_at, prediction_count
+                INSERT INTO forecast_run (
+                    source_date, observation_batch_id, route_id, route_version_id, received_at,
+                    confirmed_at, model_deployment_id, outcome, prediction_count, source_incomplete, counted_rows
                 )
-                SELECT batch.id, batch.route_version_id,
-                       deployment.id, 1, 1,
-                       batch.response_received_at, batch.response_received_at, batch.response_received_at, 0
+                SELECT (batch.scheduled_at AT TIME ZONE 'Asia/Seoul')::date, batch.id, version.route_id,
+                       batch.route_version_id, batch.response_received_at,
+                       batch.response_received_at, deployment.id, 'EMPTY', 0, false, 0
                 FROM observation_batch batch
+                JOIN route_version version ON version.id = batch.route_version_id
                 CROSS JOIN model_deployment deployment
                 WHERE batch.id = ?
                   AND deployment.release_id = 'route-contract-test'
-                RETURNING id
+                RETURNING observation_batch_id
                 """)
             .params(batchId)
             .query(Long.class)
